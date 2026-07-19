@@ -1,49 +1,48 @@
-# Contributing
+# 贡献指南
 
-## Commit message (Alibaba / Conventional Commits)
+## 提交信息（阿里巴巴 / Conventional Commits 规范）
 
-Format:
+格式：
 
 ```text
-<type>(<scope>): <subject>
+<类型>(<范围>): <主题>
 
-<body>
+<正文>
 
-<footer>
+<页脚>
 ```
 
-### Type
+### 类型
 
-| type | meaning |
-|------|---------|
-| `feat` | new feature |
-| `fix` | bug fix |
-| `docs` | documentation only |
-| `style` | formatting; no code change |
-| `refactor` | neither fix nor feature |
-| `perf` | performance |
-| `test` | tests |
-| `chore` | build / tools / misc |
-| `ci` | CI |
-| `revert` | revert a commit |
+| 类型 | 含义 |
+|------|------|
+| `feat` | 新功能 |
+| `fix` | 缺陷修复 |
+| `docs` | 仅修改文档 |
+| `style` | 格式调整，不改变代码行为 |
+| `refactor` | 既非修复也非新增功能的重构 |
+| `perf` | 性能优化 |
+| `test` | 测试 |
+| `chore` | 构建、工具或其他杂项 |
+| `ci` | 持续集成 |
+| `revert` | 撤销某次提交 |
 
-### Rules
+### 规则
 
-1. **subject**: imperative mood, no trailing period, ≤ 50 chars preferred  
-2. **scope** (optional): e.g. `filter`, `shell`, `docs`  
-3. **body**: what / why, wrap at ~72 chars  
-4. **footer**: `BREAKING CHANGE:` or `Closes #123` when needed  
+1. **主题**：使用祈使语气，不以句号结尾，建议不超过 50 个字符。
+2. **范围**（可选）：例如 `filter`、`shell`、`docs`。
+3. **正文**：说明改了什么以及为什么修改，建议每行约 72 个字符。
+4. **页脚**：需要时填写 `BREAKING CHANGE:` 或 `Closes #123`。
 
-### Examples
+### 示例
 
 ```text
-feat(filter): strip bare SGR mouse report bursts from stdin
+feat(filter): 过滤标准输入中的裸 SGR 鼠标报告串
 
-code-server leaves fragments like 80;5M79;5M when the ESC prefix
-is partially consumed. Drop multi-token bare patterns before they
-reach the TUI prompt.
+当 ESC 前缀被部分消费时，code-server 会留下类似
+80;5M79;5M 的片段。在这些多段裸模式进入 TUI 输入框前将其移除。
 
-fix(shell): sanitize LESS after Lightning rc sources --mouse
+fix(shell): 在 Lightning 启动脚本设置 --mouse 后清理 LESS
 
-docs: add one-liner install for new Studios
+docs: 添加用于新 Studio 的单行安装方式
 ```

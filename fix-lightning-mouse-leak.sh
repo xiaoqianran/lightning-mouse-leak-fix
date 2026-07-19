@@ -2,55 +2,54 @@
 # =============================================================================
 # fix-lightning-mouse-leak.sh
 #
-# One-shot, idempotent fix for terminal mouse-tracking garbage on Lightning AI
-# Studios (and similar code-server + GNU screen + TUI environments).
+# 用于修复 Lightning AI Studio（以及类似的 code-server + GNU screen + TUI
+# 环境）终端鼠标追踪乱码的一次性、幂等脚本。
 #
-# Symptom
+# 问题表现
 # -------
-# Moving the mouse dumps literal junk into the shell / Grok prompt, e.g.:
+# 移动鼠标时，Shell 或 Grok 输入框会出现如下原始乱码：
 #   80;5M79;5M77;6M57;10M48;12M40;15M...
 #
-# Root cause (layers)
+# 根本原因（分层说明）
 # -------------------
-# 1. xterm mouse-tracking modes (CSI ?1000/1002/1003/1005/1006/1015 h) make the
-#    terminal emit SGR/X10 reports on every motion/click.
-# 2. Lightning exports LESS='... --mouse ...' via /settings/.lightningrc, so
-#    `less` enables tracking.
-# 3. Default vimrc often has `set mouse=a` + `ttymouse=xterm2`.
-# 4. Lightning persists shells with GNU screen (/settings/zsh -> screen) using
-#    /settings/.screenrc — NOT ~/.screenrc.
-# 5. Grok Build TUI enables mouse capture on start (?1000h ... ?1006h). On
-#    code-server / screen, those reports are often NOT consumed by the TUI and
-#    leak into the input buffer as bare fragments like "80;5M".
+# 1. xterm 鼠标追踪模式（CSI ?1000/1002/1003/1005/1006/1015 h）会让终端在
+#    每次鼠标移动或点击时发送 SGR/X10 报告。
+# 2. Lightning 通过 /settings/.lightningrc 导出 LESS='... --mouse ...'，
+#    导致 `less` 启用鼠标追踪。
+# 3. 默认 vimrc 中经常包含 `set mouse=a` 和 `ttymouse=xterm2`。
+# 4. Lightning 使用 GNU screen（/settings/zsh -> screen）保持 Shell 会话，
+#    实际读取的是 /settings/.screenrc，而不是 ~/.screenrc。
+# 5. Grok Build TUI 启动时会启用鼠标捕获（?1000h ... ?1006h）。在
+#    code-server / screen 下，这些报告经常未被 TUI 消费，并以 "80;5M"
+#    一类裸片段泄漏到输入缓冲区。
 #
-# Fix strategy (defense in depth)
+# 修复策略（多层防护）
 # -------------------------------
-# A. Shell guard: strip --mouse from LESS after Lightning rc; emit mouse-off.
-# B. Editor / multiplexer defaults: vim mouse off; screen/tmux mousetrack off.
-# C. Immediate CSI disable on all writable PTYs + live screen sessions.
-# D. Grok PTY filter: rewrite mouse-enable CSI to disable; strip inbound reports
-#    and bare "N;NM" bursts before they reach the TUI.
+# A. Shell 防护：在 Lightning 启动脚本之后移除 LESS 中的 --mouse，并发送关闭鼠标序列。
+# B. 编辑器和终端复用器默认值：关闭 vim、screen 和 tmux 的鼠标功能。
+# C. 立即向所有可写 PTY 和活动 screen 会话发送 CSI 禁用序列。
+# D. Grok PTY 过滤器：将鼠标启用 CSI 改写为禁用，并过滤明确的输入鼠标报告。
 #
-# Usage
+# 用法
 # -----
-#   bash fix-lightning-mouse-leak.sh              # install + apply
-#   bash fix-lightning-mouse-leak.sh --check      # verify only
-#   bash fix-lightning-mouse-leak.sh --now        # only immediate CSI off
-#   bash fix-lightning-mouse-leak.sh --uninstall  # remove hooks (keep backups)
+#   bash fix-lightning-mouse-leak.sh              # 安装并应用
+#   bash fix-lightning-mouse-leak.sh --check      # 仅验证
+#   bash fix-lightning-mouse-leak.sh --now        # 仅立即关闭 CSI 鼠标模式
+#   bash fix-lightning-mouse-leak.sh --uninstall  # 移除钩子（保留备份）
 #
-# After install: RESTART any running `grok` process (exit and run `grok` again).
+# 安装后请重新启动所有正在运行的 `grok` 进程（退出后再次运行 `grok`）。
 #
-# Opt-out of Grok filter (may reintroduce leak):
+# 临时绕过 Grok 过滤器（可能再次出现乱码）：
 #   GROK_ALLOW_MOUSE=1 grok
 #
-# Portable: uses $HOME; does not hard-code a studio name. Safe to re-run.
+# 可移植：只使用 $HOME，不写死 Studio 名称，可以安全地重复运行。
 # =============================================================================
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="2.0.0"
 MARKER_BEGIN="# >>> mouse-leak fix (lightning) >>>"
 MARKER_END="# <<< mouse-leak fix (lightning) <<<"
-# Legacy markers from the first studio fix — still treated as "already installed"
+# 首版 Studio 修复所用的旧标记，仍按“已安装”处理
 LEGACY_MARKERS=(
   "mouse-leak-guard"
   "mouse-filter PATH"
@@ -90,7 +89,7 @@ while [ "$#" -gt 0 ]; do
 done
 
 # ---------------------------------------------------------------------------
-# Paths
+# 路径
 # ---------------------------------------------------------------------------
 CONFIG_SHELL_DIR="$HOME/.config/shell"
 LOCAL_BIN="$HOME/.local/bin"
@@ -110,24 +109,24 @@ LIGHTNING_RC="/settings/.lightningrc"
 need_cmd() { command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"; }
 
 # ---------------------------------------------------------------------------
-# Immediate: disable mouse tracking on this machine right now
+# 立即操作：马上关闭当前机器上的鼠标追踪
 # ---------------------------------------------------------------------------
 mouse_off_bytes() {
-  # ESC [ ? <mode> l for each common mouse mode
-  printf '\033[?1000l\033[?1002l\033[?1003l\033[?1005l\033[?1006l\033[?1015l'
+  # 为每种常见鼠标模式生成 ESC [ ? <模式> l
+  printf '\033[?9l\033[?1000l\033[?1001l\033[?1002l\033[?1003l\033[?1005l\033[?1006l\033[?1007l\033[?1015l\033[?1016l'
 }
 
 apply_now() {
-  log "Emitting mouse-off CSI (modes 1000/1002/1003/1005/1006/1015)"
+  log "Emitting mouse-off CSI (legacy, SGR and pixel mouse modes)"
   local payload
   payload="$(mouse_off_bytes)"
 
-  # Current tty
+  # 当前 TTY
   if { true >/dev/tty; } 2>/dev/null; then
     printf '%s' "$payload" >/dev/tty 2>/dev/null || true
   fi
 
-  # All writable user PTYs
+  # 所有当前用户可写的 PTY
   local pts
   for pts in /dev/pts/*; do
     [ -e "$pts" ] || continue
@@ -135,7 +134,7 @@ apply_now() {
     printf '%s' "$payload" >"$pts" 2>/dev/null || true
   done
 
-  # Live GNU screen sessions
+  # 活动的 GNU screen 会话
   if command -v screen >/dev/null 2>&1; then
     local sock name
     for sock in /run/screen/S-"$(id -un)"/* /run/screen/S-"${USER:-}"/*; do
@@ -146,7 +145,7 @@ apply_now() {
     done
   fi
 
-  # Neutralize LESS in this process (exported to children of this script only)
+  # 清理当前进程中的 LESS（只能传递给本脚本的子进程）
   if [ -n "${LESS-}" ]; then
     LESS="$(printf '%s' "$LESS" | awk '{
       out=""
@@ -163,7 +162,7 @@ apply_now() {
 }
 
 # ---------------------------------------------------------------------------
-# File install helpers (idempotent marker blocks)
+# 文件安装辅助函数（幂等标记块）
 # ---------------------------------------------------------------------------
 ensure_dir() { mkdir -p "$1"; }
 
@@ -175,11 +174,11 @@ backup_file() {
   log "Backup: $b"
 }
 
-# Remove a marked block between MARKER_BEGIN and MARKER_END (inclusive).
+# 移除 MARKER_BEGIN 与 MARKER_END 之间的标记块（包含边界行）。
 strip_marked_block() {
   local f="$1"
   [ -f "$f" ] || return 0
-  # Also strip legacy studio markers if present
+  # 同时移除可能存在的旧版 Studio 标记
   awk -v b="$MARKER_BEGIN" -v e="$MARKER_END" '
     $0 == b {skip=1; next}
     $0 == e {skip=0; next}
@@ -208,13 +207,13 @@ append_marked_block() {
 }
 
 # ---------------------------------------------------------------------------
-# Payload: shell guard
+# 安装内容：Shell 防护脚本
 # ---------------------------------------------------------------------------
 install_guard_sh() {
   ensure_dir "$CONFIG_SHELL_DIR"
   cat >"$GUARD_SH" <<'EOF'
-# mouse-leak-guard.sh — strip LESS --mouse and disable xterm mouse modes
-# Installed by fix-lightning-mouse-leak.sh — safe to re-install.
+# mouse-leak-guard.sh——移除 LESS 中的 --mouse 并关闭 xterm 鼠标模式
+# 由 fix-lightning-mouse-leak.sh 安装，可安全地重复安装。
 
 sanitize_less_value() {
   printf '%s' "$1" | awk '{
@@ -229,12 +228,16 @@ sanitize_less_value() {
 
 mouse_tracking_off_payload() {
   printf '%s' \
+    $'\033[?9l' \
     $'\033[?1000l' \
+    $'\033[?1001l' \
     $'\033[?1002l' \
     $'\033[?1003l' \
     $'\033[?1005l' \
     $'\033[?1006l' \
-    $'\033[?1015l'
+    $'\033[?1007l' \
+    $'\033[?1015l' \
+    $'\033[?1016l'
 }
 
 apply_mouse_tracking_off() {
@@ -275,7 +278,7 @@ install_mouse_off_bin() {
   ensure_dir "$LOCAL_BIN"
   cat >"$MOUSE_OFF_BIN" <<EOF
 #!/usr/bin/env bash
-# mouse-tracking-off — emit CSI disable for xterm mouse modes; sanitize LESS
+# mouse-tracking-off——发送 xterm 鼠标模式的 CSI 禁用序列并清理 LESS
 set -euo pipefail
 GUARD="\${HOME}/.config/shell/mouse-leak-guard.sh"
 [ -f "\$GUARD" ] || { echo "missing \$GUARD" >&2; exit 1; }
@@ -288,7 +291,7 @@ if [ "\${1-}" = "--log" ] && [ -n "\${2-}" ]; then
     echo -n "payload_hex="
     printf '%s' "\$payload" | od -An -tx1 | tr -s ' ' | sed 's/^ //'
     echo
-    echo "modes_disabled=1000,1002,1003,1005,1006,1015"
+    echo "modes_disabled=9,1000,1001,1002,1003,1005,1006,1007,1015,1016"
   } >"\$2"
 fi
 if { true >/dev/tty; } 2>/dev/null; then
@@ -297,36 +300,38 @@ else
   mouse_tracking_off_payload >/dev/null
 fi
 export_sanitized_less
-[ -t 1 ] || echo "mouse-tracking-off: disabled modes 1000,1002,1003,1005,1006,1015; LESS sanitized" >&2
+[ -t 1 ] || echo "mouse-tracking-off: mouse modes disabled; LESS sanitized" >&2
 EOF
   chmod +x "$MOUSE_OFF_BIN"
   log "Wrote $MOUSE_OFF_BIN"
 }
 
 # ---------------------------------------------------------------------------
-# Payload: Grok PTY mouse filter (the critical fix for Grok TUI)
+# 安装内容：Grok PTY 鼠标过滤器（Grok TUI 的关键修复）
 # ---------------------------------------------------------------------------
 install_filter_py() {
   ensure_dir "$LOCAL_BIN"
-  # Prefer sibling file shipped in the git repo (keeps filter logic in one place).
+  # 优先使用 Git 仓库随附的同目录文件，确保过滤逻辑只有一份来源。
   if [ -f "$SCRIPT_DIR/grok-mouse-filter.py" ]; then
     cp "$SCRIPT_DIR/grok-mouse-filter.py" "$FILTER_PY"
     chmod +x "$FILTER_PY"
     log "Wrote $FILTER_PY (from repo grok-mouse-filter.py)"
     return 0
   fi
+  die "missing $SCRIPT_DIR/grok-mouse-filter.py (install from the complete repository, not the shell script alone)"
+  # 下方内容只为兼容旧打包副本而保留；v2 不会执行，避免静默安装过期的内嵌过滤器。
   cat >"$FILTER_PY" <<'PY'
 #!/usr/bin/env python3
-"""PTY wrapper: stop TUI apps (Grok) from enabling terminal mouse tracking.
+"""PTY 包装器：阻止 TUI 应用（Grok）启用终端鼠标追踪。
 
-On Lightning Studio (code-server + GNU screen), Grok's mouse-enable CSI causes
-every mouse move to leak as text like ``80;5M79;5M...`` into the prompt.
+在 Lightning Studio（code-server + GNU screen）中，Grok 发出的鼠标启用 CSI
+会使每次鼠标移动都以 ``80;5M79;5M...`` 一类文本泄漏到输入框中。
 
-This wrapper:
-  1. Runs the real binary under a PTY.
-  2. Rewrites mouse *enable* CSI (?NNNNh) to *disable* (?NNNNl).
-  3. Strips inbound mouse reports and bare ``N;NM`` bursts from stdin.
-  4. Emits a full mouse-off sequence on start and exit.
+此包装器会：
+  1. 在 PTY 下运行真实二进制文件。
+  2. 将鼠标“启用”CSI（?NNNNh）改写为“禁用”（?NNNNl）。
+  3. 从标准输入中剥离鼠标报告和裸 ``N;NM`` 报告串。
+  4. 在启动及退出时发送完整的鼠标关闭序列。
 """
 from __future__ import annotations
 
@@ -556,9 +561,9 @@ resolve_grok_real() {
   local c
   for c in "${GROK_REAL_CANDIDATES[@]}"; do
     if [ -f "$c" ] && [ -x "$c" ]; then
-      # If it's our wrapper script, skip
+      # 如果是本工具生成的包装脚本，则跳过
       if head -1 "$c" 2>/dev/null | grep -q 'python\|bash'; then
-        # might be wrapper — only accept ELF
+        # 可能是包装器，只接受 ELF 文件
         if file "$c" 2>/dev/null | grep -qi 'ELF'; then
           printf '%s' "$c"
           return 0
@@ -569,7 +574,7 @@ resolve_grok_real() {
       return 0
     fi
   done
-  # Follow current grok if it's a symlink to a real binary
+  # 如果当前 grok 是指向真实二进制文件的符号链接，则跟随该链接
   if [ -L "$GROK_BIN_DIR/grok" ]; then
     local t
     t="$(readlink -f "$GROK_BIN_DIR/grok" 2>/dev/null || true)"
@@ -578,7 +583,7 @@ resolve_grok_real() {
       return 0
     fi
   fi
-  # Search downloads
+  # 搜索下载目录
   if [ -d "$HOME/.grok/downloads" ]; then
     c="$(find "$HOME/.grok/downloads" -type f -name 'grok*' -perm -111 2>/dev/null | head -1 || true)"
     if [ -n "$c" ] && file "$c" 2>/dev/null | grep -qi 'ELF'; then
@@ -599,10 +604,23 @@ install_grok_wrappers() {
     real="$HOME/.grok/downloads/grok-linux-x86_64"
   fi
 
-  # Local PATH wrapper (always first in PATH after our hook)
+  # v1 曾替换程序自带入口。这里执行一次迁移恢复，之后完全交由 Grok 更新器管理。
+  # 只处理带有本工具精确标记的文件。
+  if [ -f "$GROK_BIN_DIR/grok" ] && grep -q 'mouse-leak PTY filter' "$GROK_BIN_DIR/grok" 2>/dev/null; then
+    rm -f "$GROK_BIN_DIR/grok"
+    ln -s "$real" "$GROK_BIN_DIR/grok"
+    log "Restored vendor Grok entrypoint (v1 migration)"
+  fi
+  if [ -f "$GROK_BIN_DIR/agent" ] && grep -q 'mouse-leak PTY filter' "$GROK_BIN_DIR/agent" 2>/dev/null; then
+    rm -f "$GROK_BIN_DIR/agent"
+    ln -s grok "$GROK_BIN_DIR/agent"
+    log "Restored vendor agent entrypoint (v1 migration)"
+  fi
+
+  # 本地 PATH 包装器（加载钩子后始终位于 PATH 最前方）
   cat >"$GROK_WRAPPER_LOCAL" <<EOF
 #!/usr/bin/env bash
-# Grok entrypoint with mouse-leak PTY filter (fix-lightning-mouse-leak.sh)
+# 带鼠标乱码 PTY 过滤器的 Grok 入口（fix-lightning-mouse-leak.sh）
 set -euo pipefail
 REAL="\${GROK_REAL_BIN:-$real}"
 FILTER="\${GROK_MOUSE_FILTER:-$FILTER_PY}"
@@ -614,76 +632,44 @@ if [ ! -x "\$REAL" ]; then
   echo "Set GROK_REAL_BIN=/path/to/grok-linux-x86_64" >&2
   exit 127
 fi
+# 对所有非 TUI 命令和无界面模式保持逐字节一致的 CLI 行为。
+# 只有全屏界面和 dashboard 需要 PTY 鼠标防护。
+case "\${1-}" in
+  -h|--help|-v|--version|agent|completions|export|help|inspect|leader|login|logout|mcp|memory|models|plugin|sessions|setup|trace|update|version|worktree|wrap)
+    exec "\$REAL" "\$@" ;;
+esac
+for _arg in "\$@"; do
+  case "\$_arg" in
+    -p|--single|--single=*|--prompt-file|--prompt-file=*|--prompt-json|--prompt-json=*|--json-schema|--json-schema=*)
+      exec "\$REAL" "\$@" ;;
+  esac
+done
 exec python3 "\$FILTER" "\$REAL" "\$@"
 EOF
   chmod +x "$GROK_WRAPPER_LOCAL"
   log "Wrote $GROK_WRAPPER_LOCAL"
 
-  # ~/.grok/bin/grok — preferred by grok installer PATH
-  if [ -d "$GROK_BIN_DIR" ] || [ -x "$real" ] || [ -d "$HOME/.grok" ]; then
-    ensure_dir "$GROK_BIN_DIR"
-    # Preserve real binary as grok.real if current grok is ELF symlink/binary
-    if [ -e "$GROK_BIN_DIR/grok" ]; then
-      if file "$GROK_BIN_DIR/grok" 2>/dev/null | grep -qi 'ELF'; then
-        # Running process may hold the inode; replace via unlink
-        if [ ! -e "$GROK_BIN_DIR/grok.real" ]; then
-          cp -a "$GROK_BIN_DIR/grok" "$GROK_BIN_DIR/grok.real" 2>/dev/null \
-            || ln -sfn "$(readlink -f "$GROK_BIN_DIR/grok" 2>/dev/null || echo "$real")" \
-                 "$GROK_BIN_DIR/grok.real"
-        fi
-      fi
-      rm -f "$GROK_BIN_DIR/grok"
-    fi
-    if [ -x "$real" ] && [ ! -e "$GROK_BIN_DIR/grok.real" ]; then
-      ln -sfn "$real" "$GROK_BIN_DIR/grok.real" 2>/dev/null || true
-    fi
-    cat >"$GROK_BIN_DIR/grok" <<EOF
-#!/usr/bin/env bash
-# Grok entrypoint with mouse-leak PTY filter (fix-lightning-mouse-leak.sh)
-set -euo pipefail
-REAL="\${GROK_REAL_BIN:-$real}"
-FILTER="\${GROK_MOUSE_FILTER:-$FILTER_PY}"
-if [ "\${GROK_ALLOW_MOUSE:-0}" = "1" ]; then
-  exec "\$REAL" "\$@"
-fi
-if [ ! -x "\$REAL" ]; then
-  # Fall back to grok.real symlink
-  if [ -x "$GROK_BIN_DIR/grok.real" ]; then
-    REAL="$GROK_BIN_DIR/grok.real"
-  else
-    echo "grok: real binary not found at \$REAL" >&2
-    exit 127
-  fi
-fi
-exec python3 "\$FILTER" "\$REAL" "\$@"
-EOF
-    chmod +x "$GROK_BIN_DIR/grok"
-    log "Wrote $GROK_BIN_DIR/grok"
-
-    # agent is often the same binary
-    if [ -L "$GROK_BIN_DIR/agent" ] || [ -f "$GROK_BIN_DIR/agent" ] || [ -x "$real" ]; then
-      rm -f "$GROK_BIN_DIR/agent"
-      cp "$GROK_BIN_DIR/grok" "$GROK_BIN_DIR/agent"
-      chmod +x "$GROK_BIN_DIR/agent"
-      log "Wrote $GROK_BIN_DIR/agent (same filter wrapper)"
-    fi
-  fi
+  # 不修改 Grok 自行管理的 ~/.grok/bin/{grok,agent}。这样不会影响 Grok 更新和
+  # agent 的 argv[0] 分派；PATH 包装器已经足够。
 }
 
 # ---------------------------------------------------------------------------
-# Shell rc / vim / screen / tmux / grok config
+# Shell 启动脚本以及 vim、screen、tmux、Grok 配置
 # ---------------------------------------------------------------------------
 install_shell_rc_hooks() {
   local body
   body=$(cat <<EOF
-# After Lightning rc (LESS=...--mouse...): sanitize + disable mouse modes.
+# 在 Lightning 启动脚本设置 LESS=...--mouse... 后进行清理并关闭鼠标模式。
 if [ -f "\$HOME/.config/shell/mouse-leak-guard.sh" ]; then
   # shellcheck source=/dev/null
   . "\$HOME/.config/shell/mouse-leak-guard.sh"
   mouse_leak_guard_init
 fi
-# Prefer filtered grok + helpers.
+# 优先使用经过滤的 Grok 和辅助工具。
 export PATH="\$HOME/.local/bin:\$HOME/.grok/bin:\$PATH"
+# OpenCode 提供原生开关。无需增加额外 PTY，即可保留 attach、run、serve、
+# ACP/MCP、插件、管道、剪贴板及键盘协议。
+export OPENCODE_DISABLE_MOUSE=1
 EOF
 )
   for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
@@ -701,9 +687,9 @@ install_vimrc() {
   if [ -f "$f" ]; then
     backup_file "$f"
   fi
-  # Replace active mouse=a / ttymouse settings; keep other user config if any
+  # 替换生效中的 mouse=a/ttymouse 设置，并保留用户的其他配置
   if [ -f "$f" ] && grep -qvE '^\s*("|$)|set mouse|ttymouse' "$f"; then
-    # Has non-mouse content: strip mouse lines and append our block
+    # 存在非鼠标配置：移除鼠标设置行后追加本工具的配置块
     grep -vE '^\s*set mouse=|^\s*set ttymouse=' "$f" >"${f}.tmp.$$" || true
     mv "${f}.tmp.$$" "$f"
     append_marked_block "$f" '" Mouse tracking off — leftover SGR reports look like 80;5M...
@@ -721,14 +707,14 @@ EOF
 
 install_user_screen_tmux() {
   cat >"$HOME/.screenrc" <<'EOF'
-# Installed by fix-lightning-mouse-leak.sh
+# 由 fix-lightning-mouse-leak.sh 安装
 defmousetrack off
 mousetrack off
 EOF
   log "Wrote $HOME/.screenrc"
 
   cat >"$HOME/.tmux.conf" <<'EOF'
-# Installed by fix-lightning-mouse-leak.sh
+# 由 fix-lightning-mouse-leak.sh 安装
 set -g mouse off
 EOF
   log "Wrote $HOME/.tmux.conf"
@@ -768,7 +754,7 @@ install_grok_config() {
   fi
   backup_file "$cfg"
   if grep -q '^\[ui\]' "$cfg" 2>/dev/null; then
-    # Insert keys after [ui]
+    # 在 [ui] 后插入配置项
     awk '
       BEGIN{done=0}
       /^\[ui\]/ {print; print "mouse_reporting_toggle = true  # Ctrl+r /toggle-mouse-reporting"; print "mouse_hover = false"; done=1; next}
@@ -788,26 +774,26 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# Self-test (no network; exercises real installed functions)
+# 自检（无需网络，直接测试实际安装的函数）
 # ---------------------------------------------------------------------------
 run_selftest() {
   log "Running self-test..."
   need_cmd python3
   need_cmd awk
 
-  # LESS sanitize
+  # LESS 清理
   # shellcheck source=/dev/null
   . "$GUARD_SH"
   local got
   got="$(sanitize_less_value '--no-init --raw-control-chars --mouse --wheel-lines=3')"
   [ "$got" = "--no-init --raw-control-chars" ] || die "sanitize_less_value failed: [$got]"
 
-  # Payload modes
+  # 关闭序列所含模式
   local pay
   pay="$(mouse_tracking_off_payload | od -An -tx1)"
   echo "$pay" | grep -q '1b 5b 3f 31 30 30 30 6c' || die "payload missing 1000l"
 
-  # Filter unit checks
+  # 过滤器单元检查
   python3 - "$FILTER_PY" <<'PY'
 import sys
 path = sys.argv[1]
@@ -820,15 +806,15 @@ assert b"?1000h" not in out and b"?1000l" in out
 assert n(b"\x1b[?25h") == b"\x1b[?25h"
 assert f(b"a\x1b[<32;80;5Mb") == b"ab"
 g = b"80;5M79;5M77;6M57;10M"
-assert f(g) == b""
+assert f(g) == g, "ordinary/pasted text must never be guessed away"
 for m in (1000, 1002, 1003, 1005, 1006, 1015):
     assert f"?{m}l".encode() in off
 print("filter self-test OK")
 PY
 
-  # Wrappers mention filter
+  # 包装器必须引用过滤器
   grep -q 'grok-mouse-filter\|FILTER' "$GROK_WRAPPER_LOCAL" || die "local grok wrapper missing filter"
-  # Fresh shell LESS
+  # 新 Shell 中的 LESS
   if command -v zsh >/dev/null 2>&1; then
     local less_z
     less_z="$(zsh -ic 'echo $LESS' 2>/dev/null | tail -1 || true)"
@@ -841,7 +827,7 @@ PY
 }
 
 # ---------------------------------------------------------------------------
-# Check / uninstall
+# 检查与卸载
 # ---------------------------------------------------------------------------
 run_check() {
   local fail=0
@@ -868,7 +854,7 @@ run_check() {
       *) log "OK: LESS has no --mouse ($less_z)" ;;
     esac
   fi
-  # which grok
+  # 检查实际使用的 Grok
   if command -v grok >/dev/null 2>&1; then
     local g
     g="$(command -v grok)"
@@ -892,7 +878,7 @@ run_uninstall() {
   done
   if [ -f "$LIGHTNING_SCREENRC" ] && [ -w "$LIGHTNING_SCREENRC" ]; then
     strip_marked_block "$LIGHTNING_SCREENRC"
-    # legacy studio marker
+    # 旧版 Studio 标记
     if grep -q 'mouse-leak fix (studio)' "$LIGHTNING_SCREENRC"; then
       awk '
         /# >>> mouse-leak fix \(studio\) >>>/ {skip=1; next}
@@ -902,14 +888,6 @@ run_uninstall() {
       mv "${LIGHTNING_SCREENRC}.tmp.$$" "$LIGHTNING_SCREENRC"
     fi
     log "Cleaned $LIGHTNING_SCREENRC"
-  fi
-  # Restore grok if grok.real exists
-  if [ -e "$GROK_BIN_DIR/grok.real" ]; then
-    rm -f "$GROK_BIN_DIR/grok"
-    ln -sfn "$(readlink -f "$GROK_BIN_DIR/grok.real" 2>/dev/null || echo "$GROK_BIN_DIR/grok.real")" \
-      "$GROK_BIN_DIR/grok" 2>/dev/null \
-      || cp -a "$GROK_BIN_DIR/grok.real" "$GROK_BIN_DIR/grok"
-    log "Restored $GROK_BIN_DIR/grok from grok.real"
   fi
   for f in "$FILTER_PY" "$MOUSE_OFF_BIN" "$GROK_WRAPPER_LOCAL" "$GUARD_SH"; do
     if [ -e "$f" ]; then
@@ -921,7 +899,7 @@ run_uninstall() {
 }
 
 # ---------------------------------------------------------------------------
-# Main
+# 主流程
 # ---------------------------------------------------------------------------
 main() {
   log "fix-lightning-mouse-leak.sh v$VERSION  HOME=$HOME"
@@ -941,7 +919,7 @@ main() {
     return 0
   fi
 
-  # Full install
+  # 完整安装
   need_cmd python3
   need_cmd awk
   need_cmd file
@@ -975,11 +953,12 @@ INSTALL COMPLETE (v$VERSION)
 What was installed
   - $GUARD_SH
   - $MOUSE_OFF_BIN
-  - $FILTER_PY          ← critical for Grok TUI
+  - $FILTER_PY          ← only used for interactive Grok TUI
   - $GROK_WRAPPER_LOCAL
+  - OPENCODE_DISABLE_MOUSE=1 in shell hooks (native OpenCode support)
   - Shell hooks in ~/.zshrc and ~/.bashrc (after Lightning managed block)
   - ~/.vimrc mouse off, ~/.screenrc / ~/.tmux.conf, optional /settings/.screenrc
-  - ~/.grok/config.toml mouse_reporting_toggle (if .grok exists)
+  - ~/.grok/config.toml mouse hover off (if .grok exists)
 
 IMPORTANT — restart Grok
   Already-running Grok processes still use the old binary path.

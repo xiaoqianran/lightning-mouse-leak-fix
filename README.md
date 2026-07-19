@@ -1,85 +1,90 @@
 # lightning-mouse-leak-fix
 
-One-shot, idempotent fix for **terminal mouse-tracking garbage** on [Lightning AI](https://lightning.ai) Studios (code-server + GNU screen + TUI apps such as Grok Build).
+用于解决 [Lightning AI](https://lightning.ai) Studio（code-server + GNU screen + OpenCode / Grok Build）中**终端鼠标追踪乱码**的一次性、幂等修复工具。
 
-## Symptom
+## 问题表现
 
-Moving the mouse dumps literal junk into the shell or Grok prompt:
+移动鼠标时，Shell 或 Grok 输入框会出现以下乱码：
 
 ```text
 80;5M79;5M77;6M57;10M48;12M40;15M...
 ```
 
-## Quick start (any Lightning Studio)
+## 快速开始（适用于任意 Lightning Studio）
 
 ```bash
-# clone then install
+# 克隆并安装
 git clone https://github.com/xiaoqianran/lightning-mouse-leak-fix.git
 cd lightning-mouse-leak-fix
 bash fix-lightning-mouse-leak.sh
 
-# verify
+# 验证
 bash fix-lightning-mouse-leak.sh --check
 ```
 
-Or one-liner after copy:
+请将安装脚本与 `grok-mouse-filter.py` 放在同一目录。安装完成后需要**重新启动 OpenCode/Grok**，以便应用新的环境变量和包装器。
 
-```bash
-bash fix-lightning-mouse-leak.sh
-```
+## 根本原因（分层说明）
 
-**Restart Grok after install** (`/exit` then `grok`) so the PTY filter wraps the real binary.
+| 层级 | 具体原因 |
+|------|----------|
+| 终端协议 | xterm 鼠标模式 `CSI ?1000/1002/1003/1005/1006/1015 h` 会让终端在每次鼠标移动时发送 SGR/X10 报告 |
+| Lightning `LESS` | `/settings/.lightningrc` 会导出包含 `--mouse` 的 `LESS` |
+| Vim | 常见配置中包含 `set mouse=a` 和 `ttymouse=xterm2` |
+| GNU screen | Lightning 通过 `/settings/zsh` → `screen` 使用 `/settings/.screenrc`，而不是 `~/.screenrc` |
+| **OpenCode TUI** | 默认启用鼠标，但提供原生的 `OPENCODE_DISABLE_MOUSE` 开关 |
+| **Grok TUI** | 会启用鼠标捕获；在 code-server + screen 下，报告可能以裸 `80;5M...` 片段泄漏到输入缓冲区 |
 
-## Root cause (layers)
+## 脚本安装的内容
 
-| Layer | What happens |
-|-------|----------------|
-| Protocol | xterm mouse modes `CSI ?1000/1002/1003/1005/1006/1015 h` make the terminal emit SGR/X10 reports on every motion |
-| Lightning `LESS` | `/settings/.lightningrc` exports `LESS=...--mouse...` |
-| Vim | Common `set mouse=a` + `ttymouse=xterm2` |
-| GNU screen | Lightning uses `/settings/.screenrc` (not `~/.screenrc`) via `/settings/zsh` → `screen` |
-| **Grok TUI** | Enables mouse capture on start; under code-server + screen, reports often leak into the input buffer as bare `80;5M...` (**primary user-visible cause**) |
+脚本采用多层防护：
 
-## What the script installs
+1. **Shell 防护**——在 Lightning 启动脚本之后，从 `LESS` 中移除 `--mouse` 和 `--wheel-lines=*`；交互式 Shell 启动时发送关闭鼠标的 CSI。
+2. **Vim / tmux / `~/.screenrc`**——默认关闭鼠标追踪。
+3. **`/settings/.screenrc`**——文件可写时加入 `mousetrack off`，这是 Lightning 实际使用的 screen 配置。
+4. **OpenCode 原生模式**——导出 `OPENCODE_DISABLE_MOUSE=1`；不使用包装器，因此所有 CLI/TUI 功能均保留原生标准输入输出、键盘、剪贴板和更新行为。
+5. **选择性 Grok 包装器**——只有交互式 TUI/dashboard 会使用 PTY 过滤器；无界面模式及所有管理子命令均直接执行真实二进制文件。
+6. **安全协议过滤器**——将鼠标“启用”CSI 改写为“禁用”，只剥离带 ESC 前缀的明确鼠标报告，同时保留焦点事件、OSC 52、括号粘贴、Kitty/CSI 按键及普通文本。
+7. **Grok 自主管理程序文件**——不替换 `~/.grok/bin/grok` 和 `agent`，确保 `update`、补全以及基于 `argv` 的入口分派正常工作。
 
-Defense in depth:
-
-1. **Shell guard** — strip `--mouse` / `--wheel-lines=*` from `LESS` after Lightning rc; emit mouse-off CSI on interactive start  
-2. **Vim / tmux / `~/.screenrc`** — mouse tracking off by default  
-3. **`/settings/.screenrc`** — `mousetrack off` when writable (Lightning’s real screen config)  
-4. **Grok PTY filter** (critical) — rewrite mouse-**enable** CSI to **disable**; strip inbound reports and bare `N;NM` bursts  
-5. **Wrappers** — `~/.local/bin/grok` and `~/.grok/bin/grok` run the filter  
-
-## CLI
+## 命令行用法
 
 ```text
-bash fix-lightning-mouse-leak.sh              # install + apply + self-test
-bash fix-lightning-mouse-leak.sh --check      # verify only
-bash fix-lightning-mouse-leak.sh --now        # immediate CSI mouse-off only
-bash fix-lightning-mouse-leak.sh --uninstall  # remove hooks
-bash fix-lightning-mouse-leak.sh --help
+bash fix-lightning-mouse-leak.sh              # 安装、立即应用并自检
+bash fix-lightning-mouse-leak.sh --check      # 仅验证
+bash fix-lightning-mouse-leak.sh --now        # 仅立即关闭 CSI 鼠标模式
+bash fix-lightning-mouse-leak.sh --uninstall  # 移除安装钩子
+bash fix-lightning-mouse-leak.sh --help       # 显示帮助
 ```
 
-Manual reset anytime:
+需要时可手动重置：
 
 ```bash
-mouse_off                 # shell function after a new interactive shell
-mouse-tracking-off        # CLI
+mouse_off                 # 新交互式 Shell 中提供的函数
+mouse-tracking-off        # 命令行工具
 ```
 
-Re-enable Grok mouse (may reintroduce the leak):
+只为单次运行重新启用鼠标（可能再次出现乱码）：
 
 ```bash
 GROK_ALLOW_MOUSE=1 grok
+env -u OPENCODE_DISABLE_MOUSE opencode
 ```
 
-## Requirements
+## 运行要求
 
-- `bash`, `python3`, `awk`, `file`
-- Optional: `zsh`, `screen`, Grok Build (`~/.grok`)
+- 必需：`bash`、`python3`、`awk`、`file`
+- 可选：`zsh`、`screen`、OpenCode、Grok Build（`~/.grok`）
 
-Portable: uses `$HOME` only; safe to re-run (idempotent markers).
+## 测试
 
-## License
+```bash
+python3 tests/test_mouse_filter.py
+bash tests/test_installer.sh
+```
+
+脚本只使用 `$HOME`，可以安全地重复运行（通过标记块保证幂等）。
+
+## 许可证
 
 MIT

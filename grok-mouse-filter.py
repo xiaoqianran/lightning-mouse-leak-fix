@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""PTY wrapper: stop TUI apps (Grok) from enabling terminal mouse tracking.
+"""PTY 包装器：阻止 TUI 应用（Grok）启用终端鼠标追踪。
 
-On Lightning Studio (code-server + GNU screen), Grok's mouse-enable CSI causes
-every mouse move to leak as text like ``80;5M79;5M...`` into the prompt.
+在 Lightning Studio（code-server + GNU screen）中，Grok 发出的鼠标启用 CSI
+会使每次鼠标移动都以 ``80;5M79;5M...`` 一类文本泄漏到输入框中。
 
-Also carefully passes keyboard keys (Esc, Ctrl+U, arrows, etc.) without
-gluing bare Esc to the next keystroke.
+过滤器只移除能从协议上明确识别的鼠标字节。普通文本、粘贴内容、键盘协议、
+OSC 剪贴板通信和焦点事件均会保留。
 """
 from __future__ import annotations
 
@@ -22,20 +22,18 @@ import termios
 import time
 import tty
 
-MOUSE_MODES = (1000, 1002, 1003, 1005, 1006, 1015)
+# 特意排除 1004：它代表焦点报告，而不是鼠标报告。
+MOUSE_MODES = (9, 1000, 1001, 1002, 1003, 1005, 1006, 1007, 1015, 1016)
 MOUSE_MODE_SET = {str(m).encode() for m in MOUSE_MODES}
 DECSET_RE = re.compile(rb"\x1b\[\?([0-9;]+)([hl])")
 MOUSE_IN_RE = re.compile(
     rb"(?:"
     rb"\x1b\[<\d+(?:;\d+)*[Mm]"  # SGR 1006
-    rb"|\x1b\[M[\x00-\xff]{3}"  # X10 1000 (exactly 3 bytes after M)
+    rb"|\x1b\[M[\x00-\xff]{3}"  # X10 1000（M 后面恰好有 3 个字节）
     rb")"
 )
-# Bare leaked motion fragments: 80;5M79;5M... (2+ reports)
-BARE_MOUSE_RE = re.compile(rb"(?:\d{1,4};\d{1,4}[Mm]){2,}")
-
-# Incomplete CSI/SS3 hold timeout (seconds). Bare Esc must flush so it is not
-# glued to the next key (Ctrl+U, letters, etc.).
+# 不完整 CSI/SS3 的暂存超时（秒）。必须及时转发单独的 Esc，避免它与下一个按键
+#（Ctrl+U、字母等）粘连。
 HOLD_TIMEOUT_S = 0.05
 
 
@@ -64,60 +62,62 @@ def neutralize_output(data: bytes) -> bytes:
 
 
 def filter_input(data: bytes) -> bytes:
-    """Strip mouse reports only — never drop keyboard Esc / CSI / controls."""
-    data = MOUSE_IN_RE.sub(b"", data)
-    data = BARE_MOUSE_RE.sub(b"", data)
-    return data
+    """只剥离带 ESC 前缀、能够明确识别的鼠标报告。
+
+    无法安全判定裸 ``80;5M79;5M`` 一类字节，因为它们可能是键入或粘贴的内容。
+    在输出侧阻止鼠标 DECSET，可以从源头阻止新报告，同时不破坏正常输入。
+    """
+    return MOUSE_IN_RE.sub(b"", data)
 
 
 def _is_incomplete_esc_suffix(buf: bytes) -> bool:
-    """True if buf ends with an incomplete terminal escape sequence to hold."""
+    """如果缓冲区末尾是不完整且需要暂存的终端转义序列，则返回真。"""
     if not buf:
         return False
-    # Find last ESC
+    # 查找最后一个 ESC
     esc = buf.rfind(b"\x1b")
     if esc < 0:
         return False
     seq = buf[esc:]
-    # Bare ESC — incomplete until timeout (caller flushes)
+    # 单独的 ESC：超时前视为不完整，之后由调用方转发
     if seq == b"\x1b":
         return True
-    # OSC: ESC ] ... BEL or ST
+    # OSC：ESC ] ... BEL 或 ST
     if seq.startswith(b"\x1b]"):
         if seq.endswith(b"\x07") or seq.endswith(b"\x1b\\"):
             return False
         return True
-    # SS3: ESC O <final>
+    # SS3：ESC O <结束字节>
     if seq.startswith(b"\x1bO"):
         return len(seq) < 3
-    # CSI: ESC [ params/intermediates final(@-~)
+    # CSI：ESC [ 参数/中间字节 结束字节（@-~）
     if seq.startswith(b"\x1b["):
         if len(seq) == 2:
             return True
         for i, b in enumerate(seq[2:], start=2):
-            if 0x40 <= b <= 0x7E:  # final byte
-                # Complete when final is the last byte; else junk after final → flush all
+            if 0x40 <= b <= 0x7E:  # 结束字节
+                # 找到结束字节即代表序列完整；其后若有内容则一并转发
                 return False
-        return True  # no final yet
-    # ESC + one other char that is NOT start of CSI/OSC/SS3:
-    # treat as complete 2-byte sequence (e.g. ESC alone already handled;
-    # ESC followed by plain letter is Alt+letter — complete when we have 2 bytes)
+        return True  # 尚未出现结束字节
+    # ESC 后跟一个不是 CSI/OSC/SS3 起始字符的字符：
+    # 将其视为完整的双字节序列（单独 ESC 已在上方处理；ESC 后跟普通字母
+    # 表示 Alt+字母，收齐两个字节即为完整）
     if len(seq) >= 2:
         return False
     return True
 
 
 def split_hold(buf: bytes) -> tuple[bytes, bytes]:
-    """Split buf into (forward_now, hold). Only hold incomplete ESC sequences."""
+    """将缓冲区拆成（立即转发内容，暂存内容），只暂存不完整的 ESC 序列。"""
     if not buf:
         return b"", b""
     esc = buf.rfind(b"\x1b")
     if esc < 0:
         return buf, b""
-    # If nothing incomplete at end, forward all
+    # 如果末尾没有不完整序列，则全部转发
     if not _is_incomplete_esc_suffix(buf):
         return buf, b""
-    # Hold from last ESC; forward prefix
+    # 从最后一个 ESC 开始暂存，先转发前缀
     return buf[:esc], buf[esc:]
 
 
@@ -236,7 +236,7 @@ def main(argv: list[str]) -> int:
                     except OSError:
                         break
 
-            # Flush incomplete keyboard ESC after timeout (do NOT glue to next key)
+            # 超时后转发不完整的键盘 ESC，绝不能与下一个按键粘连
             if in_buf and in_hold_since is not None and (now - in_hold_since) >= HOLD_TIMEOUT_S:
                 try:
                     os.write(master_fd, in_buf)
