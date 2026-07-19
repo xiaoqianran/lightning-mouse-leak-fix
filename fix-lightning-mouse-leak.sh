@@ -59,6 +59,7 @@ LEGACY_MARKERS=(
 
 HOME="${HOME:-$(cd ~ && pwd)}"
 export HOME
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 DO_INSTALL=1
 DO_CHECK=0
@@ -307,6 +308,13 @@ EOF
 # ---------------------------------------------------------------------------
 install_filter_py() {
   ensure_dir "$LOCAL_BIN"
+  # Prefer sibling file shipped in the git repo (keeps filter logic in one place).
+  if [ -f "$SCRIPT_DIR/grok-mouse-filter.py" ]; then
+    cp "$SCRIPT_DIR/grok-mouse-filter.py" "$FILTER_PY"
+    chmod +x "$FILTER_PY"
+    log "Wrote $FILTER_PY (from repo grok-mouse-filter.py)"
+    return 0
+  fi
   cat >"$FILTER_PY" <<'PY'
 #!/usr/bin/env python3
 """PTY wrapper: stop TUI apps (Grok) from enabling terminal mouse tracking.
