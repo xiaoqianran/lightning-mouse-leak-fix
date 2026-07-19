@@ -125,7 +125,6 @@ apply_now() {
   if [ -w /dev/tty ] 2>/dev/null; then
     { printf '%s' "$payload" >/dev/tty; } 2>/dev/null || true
   fi
-  # Live screen: mousetrack off only (do not stuff CSI into the session)
   if command -v screen >/dev/null 2>&1; then
     local sock name
     for sock in /run/screen/S-"$(id -un)"/* /run/screen/S-"${USER:-}"/*; do
@@ -148,6 +147,8 @@ apply_now() {
   fi
   log "Immediate mouse-off applied"
 }
+
+
 # ---------------------------------------------------------------------------
 # 文件安装辅助函数（幂等标记块）
 # ---------------------------------------------------------------------------
@@ -603,8 +604,8 @@ install_grok_wrappers() {
     log "Restored vendor agent entrypoint (v1 migration)"
   fi
 
-  # Note: on Lightning, $HOME/.local often symlinks to /home/zeus/.local (shared).
-  # Wrapper must resolve the real ELF under the *current* $HOME at runtime.
+  # Note: on Lightning, $HOME/.local often → /home/zeus/.local (shared across Studios).
+  # The wrapper must resolve the real ELF under the *current* $HOME at runtime.
   cat >"$GROK_WRAPPER_LOCAL" <<'WRAP'
 #!/usr/bin/env bash
 # Grok entry + mouse-leak PTY filter (fix-lightning-mouse-leak.sh v2.2)
@@ -741,18 +742,16 @@ WRAP
   chmod +x "$GROK_WRAPPER_LOCAL"
   log "Wrote $GROK_WRAPPER_LOCAL (v2.2 runtime ELF magic detection)"
 
-  # Smoke: if binary exists, --version must work
   if real="$(resolve_grok_real)"; then
     if "$GROK_WRAPPER_LOCAL" --version >/dev/null 2>&1; then
       log "Smoke OK: grok --version via wrapper"
     else
-      warn "Smoke FAILED: wrapper could not run --version (see grok --version manually)"
+      warn "Smoke FAILED: wrapper could not run --version"
     fi
   fi
 }
 
-# ---------------------------------------------------------------------------
-# Shellinstall_shell_rc_hooks() {
+install_shell_rc_hooks() {
   local body
   body=$(cat <<EOF
 # 在 Lightning 启动脚本设置 LESS=...--mouse... 后进行清理并关闭鼠标模式。
