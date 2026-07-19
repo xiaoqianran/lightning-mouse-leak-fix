@@ -168,3 +168,16 @@ grok --version
 
 Older versions sprayed mouse-off CSI to every PTY. **v2.2+** only writes to `/dev/tty`.
 Open a new terminal tab or run `reset`.
+
+### downloads 里有 `grok-linux-x86_64` 但仍报未找到 ELF
+
+看文件大小：真身一般 **> 50MB**。若只有几 KB（例如 **3613**），那是 shell 脚本被误当成二进制（包装器或错误拷贝），不是 zsh 问题。
+
+```bash
+wc -c ~/.grok/downloads/grok-linux-x86_64
+file ~/.grok/downloads/grok-linux-x86_64   # 必须含 ELF
+
+# 重新安装真身
+curl -fsSL https://x.ai/cli/install.sh | bash
+grok --version
+```

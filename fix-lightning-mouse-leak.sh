@@ -46,7 +46,7 @@
 # =============================================================================
 set -euo pipefail
 
-VERSION="2.2.0"
+VERSION="2.3.0"
 MARKER_BEGIN="# >>> mouse-leak fix (lightning) >>>"
 MARKER_END="# <<< mouse-leak fix (lightning) <<<"
 # 首版 Studio 修复所用的旧标记，仍按“已安装”处理
@@ -585,162 +585,37 @@ resolve_grok_real() {
 install_grok_wrappers() {
   ensure_dir "$LOCAL_BIN"
   if real="$(resolve_grok_real)"; then
-    log "Found Grok binary: $real"
+    log "Found Grok binary: $real ($(wc -c <"$real" | tr -d ' ') bytes)"
   else
-    warn "Grok binary not found yet — installing smart runtime wrapper anyway"
+    warn "Grok binary not found yet (or not a real ELF) — installing smart wrapper anyway"
   fi
 
-  # v1 migration: restore vendor entrypoints if we previously overwrote them
-  if [ -f "$GROK_BIN_DIR/grok" ] && grep -q 'mouse-leak PTY filter' "$GROK_BIN_DIR/grok" 2>/dev/null; then
+  if [ -f "$GROK_BIN_DIR/grok" ] && grep -qE 'mouse-leak PTY filter|Grok entry \+ mouse-leak' "$GROK_BIN_DIR/grok" 2>/dev/null; then
     rm -f "$GROK_BIN_DIR/grok"
     if real="$(resolve_grok_real)"; then
       ln -sfn "$real" "$GROK_BIN_DIR/grok"
     fi
     log "Restored vendor Grok entrypoint (v1 migration)"
   fi
-  if [ -f "$GROK_BIN_DIR/agent" ] && grep -q 'mouse-leak PTY filter' "$GROK_BIN_DIR/agent" 2>/dev/null; then
-    rm -f "$GROK_BIN_DIR/agent"
-    ln -sfn grok "$GROK_BIN_DIR/agent" 2>/dev/null || true
-    log "Restored vendor agent entrypoint (v1 migration)"
+
+  local src_wrap="$SCRIPT_DIR/grok-wrapper.sh"
+  if [ ! -f "$src_wrap" ]; then
+    die "missing $src_wrap (re-clone https://github.com/xiaoqianran/lightning-mouse-leak-fix)"
   fi
-
-  # Note: on Lightning, $HOME/.local often → /home/zeus/.local (shared across Studios).
-  # The wrapper must resolve the real ELF under the *current* $HOME at runtime.
-  cat >"$GROK_WRAPPER_LOCAL" <<'WRAP'
-#!/usr/bin/env bash
-# Grok entry + mouse-leak PTY filter (fix-lightning-mouse-leak.sh v2.2)
-# Runtime-resolves the real ELF. Safe if fix is installed before Grok.
-set -u
-
-_find_python() {
-  local p
-  for p in /usr/bin/python3 /bin/python3; do
-    [ -x "$p" ] && { printf '%s' "$p"; return 0; }
-  done
-  return 1
-}
-
-# True if path is a readable ELF (magic 0x7f ELF). No dependency on `file`.
-_is_elf() {
-  local f="$1" b
-  [ -n "$f" ] || return 1
-  [ -e "$f" ] || return 1
-  [ -r "$f" ] || return 1
-  # must be executable by us OR world/group (some installs are 755/744)
-  [ -x "$f" ] || return 1
-  b=$(head -c 4 "$f" 2>/dev/null) || return 1
-  # bash string compare with ANSI-C quoting
-  [ "$b" = $'\x7fELF' ]
-}
-
-_find_real_grok() {
-  local self c t home
-  home="${HOME:-}"
-  [ -n "$home" ] || home="$(cd ~ && pwd)"
-  self="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
-
-  _try() {
-    local p="$1" r
-    [ -n "$p" ] || return 1
-    [ -e "$p" ] || return 1
-    r="$(readlink -f "$p" 2>/dev/null || printf '%s' "$p")"
-    [ "$r" = "$self" ] && return 1
-    _is_elf "$r" || return 1
-    printf '%s' "$r"
-    return 0
-  }
-
-  # 1) explicit override
-  if [ -n "${GROK_REAL_BIN:-}" ]; then
-    _try "$GROK_REAL_BIN" && return 0
-  fi
-
-  # 2) well-known locations under this HOME (per-studio)
-  for c in \
-    "$home/.grok/downloads/grok-linux-x86_64" \
-    "$home/.grok/downloads/grok-linux-aarch64" \
-    "$home/.grok/downloads/grok" \
-    "$home/.grok/bin/grok.real" \
-    "$home/.grok/bin/grok" \
-    "$home/.grok/bin/agent"
-  do
-    _try "$c" && return 0
-  done
-
-  # 3) any grok* ELF in downloads
-  if [ -d "$home/.grok/downloads" ]; then
-    for c in "$home/.grok/downloads"/grok*; do
-      _try "$c" && return 0
-    done
-  fi
-
-  # 4) PATH entries that are real ELFs (skip our wrapper)
-  local p
-  # shellcheck disable=SC2046
-  for p in $(type -a grok 2>/dev/null | awk '/is /{print $NF}' ; command -v -a grok 2>/dev/null); do
-    _try "$p" && return 0
-  done
-
-  return 1
-}
-
-REAL=""
-if ! REAL="$(_find_real_grok)"; then
-  echo "grok: 未找到真实 Grok 二进制（ELF）。" >&2
-  echo "  HOME=${HOME:-<unset>}" >&2
-  echo "  已检查: \$HOME/.grok/downloads/grok-linux-* 与 \$HOME/.grok/bin/grok" >&2
-  if [ -d "${HOME}/.grok/downloads" ]; then
-    echo "  downloads 目录内容:" >&2
-    ls -la "${HOME}/.grok/downloads" 2>&1 | sed 's/^/    /' >&2 || true
-  else
-    echo "  不存在: ${HOME}/.grok/downloads  （请先安装 Grok Build）" >&2
-  fi
-  if [ -d "${HOME}/.grok/bin" ]; then
-    echo "  bin 目录内容:" >&2
-    ls -la "${HOME}/.grok/bin" 2>&1 | sed 's/^/    /' >&2 || true
-  fi
-  echo "  或设置: export GROK_REAL_BIN=/绝对路径/grok-linux-x86_64" >&2
-  exit 127
-fi
-
-FILTER="${GROK_MOUSE_FILTER:-${HOME}/.local/bin/grok-mouse-filter.py}"
-
-if [ "${GROK_ALLOW_MOUSE:-0}" = "1" ]; then
-  exec "$REAL" "$@"
-fi
-
-# Non-TUI: always pass through
-case "${1-}" in
-  -h|--help|-v|--version|agent|completions|export|help|inspect|leader|login|logout|mcp|memory|models|plugin|sessions|setup|trace|update|version|worktree|wrap)
-    exec "$REAL" "$@"
-    ;;
-esac
-for _arg in "$@"; do
-  case "$_arg" in
-    -p|--single|--single=*|--prompt-file|--prompt-file=*|--prompt-json|--prompt-json=*|--json-schema|--json-schema=*)
-      exec "$REAL" "$@"
-      ;;
-  esac
-done
-
-# No TTY → direct
-if [ ! -t 0 ] || [ ! -t 1 ]; then
-  exec "$REAL" "$@"
-fi
-
-if [ ! -f "$FILTER" ]; then
-  exec "$REAL" "$@"
-fi
-PY="$(_find_python || true)"
-if [ -z "${PY:-}" ]; then
-  echo "grok: 警告: 无系统 python3，直连 Grok（可能有鼠标乱码）" >&2
-  exec "$REAL" "$@"
-fi
-
-exec "$PY" "$FILTER" "$REAL" "$@"
-WRAP
+  cp "$src_wrap" "$GROK_WRAPPER_LOCAL"
   chmod +x "$GROK_WRAPPER_LOCAL"
-  log "Wrote $GROK_WRAPPER_LOCAL (v2.2 runtime ELF magic detection)"
+  log "Wrote $GROK_WRAPPER_LOCAL (v2.3)"
+
+  local cand="$HOME/.grok/downloads/grok-linux-x86_64"
+  if [ -e "$cand" ]; then
+    local magic sz
+    magic=$(head -c 4 "$cand" 2>/dev/null || true)
+    sz=$(wc -c <"$cand" 2>/dev/null | tr -d ' ')
+    if [ "$magic" != $'\x7fELF' ]; then
+      warn "WARNING: $cand is NOT a real Grok ELF (size=${sz}). Often a shell script was copied over the binary."
+      warn "Fix: curl -fsSL https://x.ai/cli/install.sh | bash"
+    fi
+  fi
 
   if real="$(resolve_grok_real)"; then
     if "$GROK_WRAPPER_LOCAL" --version >/dev/null 2>&1; then
@@ -748,6 +623,8 @@ WRAP
     else
       warn "Smoke FAILED: wrapper could not run --version"
     fi
+  else
+    warn "No real Grok ELF yet — install Grok first, then: grok --version"
   fi
 }
 
