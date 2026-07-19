@@ -97,7 +97,7 @@ MIT
 `/commands/python3` or conda), which can hang on import; or the real binary path
 was baked in at install time before Grok was downloaded.
 
-**Fix:** upgrade to **v2.1+** and re-run:
+**Fix:** upgrade to **v2.2+** and re-run:
 
 ```bash
 git pull
@@ -132,3 +132,39 @@ rm -f ~/.local/bin/grok            # remove PATH shadow
 hash -r
 ~/.grok/bin/grok                   # vendor entry
 ```
+
+
+### `grok: 未找到真实 Grok 二进制（ELF）`
+
+Lightning often makes `$HOME/.local` → `/home/zeus/.local` (**shared** across Studios).
+The wrapper lives there, but the **real Grok binary is per-studio** under:
+
+```text
+$HOME/.grok/downloads/grok-linux-x86_64
+$HOME/.grok/bin/grok
+```
+
+1. Confirm the binary exists:
+
+```bash
+ls -la ~/.grok/downloads/ ~/.grok/bin/
+```
+
+2. If missing, install Grok Build first, then:
+
+```bash
+bash fix-lightning-mouse-leak.sh
+grok --version
+```
+
+3. Or set an absolute path:
+
+```bash
+export GROK_REAL_BIN=$HOME/.grok/downloads/grok-linux-x86_64
+grok --version
+```
+
+### Prompt shows `1000l1002l...` after running the fix
+
+Older versions sprayed mouse-off CSI to every PTY. **v2.2+** only writes to `/dev/tty`.
+Open a new terminal tab or run `reset`.

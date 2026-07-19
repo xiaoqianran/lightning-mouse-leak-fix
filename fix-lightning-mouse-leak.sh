@@ -46,7 +46,7 @@
 # =============================================================================
 set -euo pipefail
 
-VERSION="2.1.0"
+VERSION="2.2.0"
 MARKER_BEGIN="# >>> mouse-leak fix (lightning) >>>"
 MARKER_END="# <<< mouse-leak fix (lightning) <<<"
 # 首版 Studio 修复所用的旧标记，仍按“已安装”处理
@@ -117,35 +117,23 @@ mouse_off_bytes() {
 }
 
 apply_now() {
-  log "Emitting mouse-off CSI (legacy, SGR and pixel mouse modes)"
+  log "Emitting mouse-off CSI (only to real /dev/tty — never spray all PTYs)"
   local payload
   payload="$(mouse_off_bytes)"
-
-  # 当前 TTY
-  if { true >/dev/tty; } 2>/dev/null; then
-    printf '%s' "$payload" >/dev/tty 2>/dev/null || true
+  # Only the current controlling terminal. Writing to every /dev/pts dumps
+  # visible garbage (1000l1002l...) into interactive shells.
+  if [ -w /dev/tty ] 2>/dev/null; then
+    { printf '%s' "$payload" >/dev/tty; } 2>/dev/null || true
   fi
-
-  # 所有当前用户可写的 PTY
-  local pts
-  for pts in /dev/pts/*; do
-    [ -e "$pts" ] || continue
-    [ -w "$pts" ] || continue
-    printf '%s' "$payload" >"$pts" 2>/dev/null || true
-  done
-
-  # 活动的 GNU screen 会话
+  # Live screen: mousetrack off only (do not stuff CSI into the session)
   if command -v screen >/dev/null 2>&1; then
     local sock name
     for sock in /run/screen/S-"$(id -un)"/* /run/screen/S-"${USER:-}"/*; do
       [ -e "$sock" ] || continue
       name="$(basename "$sock")"
       screen -S "$name" -X eval 'mousetrack off' 2>/dev/null || true
-      screen -S "$name" -X stuff "$payload" 2>/dev/null || true
     done
   fi
-
-  # 清理当前进程中的 LESS（只能传递给本脚本的子进程）
   if [ -n "${LESS-}" ]; then
     LESS="$(printf '%s' "$LESS" | awk '{
       out=""
@@ -160,7 +148,6 @@ apply_now() {
   fi
   log "Immediate mouse-off applied"
 }
-
 # ---------------------------------------------------------------------------
 # 文件安装辅助函数（幂等标记块）
 # ---------------------------------------------------------------------------
@@ -596,18 +583,16 @@ resolve_grok_real() {
 
 install_grok_wrappers() {
   ensure_dir "$LOCAL_BIN"
-  local real=""
   if real="$(resolve_grok_real)"; then
     log "Found Grok binary: $real"
   else
-    warn "Grok binary not found yet — installing a smart wrapper that resolves at runtime"
-    real=""
+    warn "Grok binary not found yet — installing smart runtime wrapper anyway"
   fi
 
-  # v1 曾替换程序自带入口。迁移恢复后交由 Grok 更新器管理 ~/.grok/bin。
+  # v1 migration: restore vendor entrypoints if we previously overwrote them
   if [ -f "$GROK_BIN_DIR/grok" ] && grep -q 'mouse-leak PTY filter' "$GROK_BIN_DIR/grok" 2>/dev/null; then
     rm -f "$GROK_BIN_DIR/grok"
-    if [ -n "$real" ]; then
+    if real="$(resolve_grok_real)"; then
       ln -sfn "$real" "$GROK_BIN_DIR/grok"
     fi
     log "Restored vendor Grok entrypoint (v1 migration)"
@@ -618,107 +603,112 @@ install_grok_wrappers() {
     log "Restored vendor agent entrypoint (v1 migration)"
   fi
 
-  # 智能 PATH 包装器：
-  # - 运行时查找真实 ELF（先装 fix 后装 grok 也能用）
-  # - 强制系统 Python，避开 conda//commands/python3 卡住
-  # - 过滤器失败时回退直连真实二进制
-  cat >"$GROK_WRAPPER_LOCAL" <<'EOF'
+  # Note: on Lightning, $HOME/.local often symlinks to /home/zeus/.local (shared).
+  # Wrapper must resolve the real ELF under the *current* $HOME at runtime.
+  cat >"$GROK_WRAPPER_LOCAL" <<'WRAP'
 #!/usr/bin/env bash
-# 带鼠标乱码 PTY 过滤器的 Grok 入口（fix-lightning-mouse-leak.sh v2.1）
-# 运行时解析真实二进制；可在 Grok 尚未安装时先部署本包装器。
-set -euo pipefail
+# Grok entry + mouse-leak PTY filter (fix-lightning-mouse-leak.sh v2.2)
+# Runtime-resolves the real ELF. Safe if fix is installed before Grok.
+set -u
 
-# 查找系统 Python（不要用 PATH 里的 conda 或 /commands/python3，偶发卡死在 import）
 _find_python() {
   local p
   for p in /usr/bin/python3 /bin/python3; do
-    if [ -x "$p" ]; then
-      printf '%s' "$p"
-      return 0
-    fi
+    [ -x "$p" ] && { printf '%s' "$p"; return 0; }
   done
-  # 最后才退回 PATH，但仍排除明显的 conda envs
-  p="$(command -v python3 2>/dev/null || true)"
-  case "$p" in
-    *miniconda*|*anaconda*|*conda/envs*|/commands/python*)
-      return 1 ;;
-  esac
-  [ -n "$p" ] && [ -x "$p" ] && printf '%s' "$p"
+  return 1
 }
 
-# 判断是否为 ELF 可执行文件（排除 bash/python 包装脚本）
+# True if path is a readable ELF (magic 0x7f ELF). No dependency on `file`.
 _is_elf() {
-  local f="$1"
-  [ -f "$f" ] && [ -x "$f" ] || return 1
-  # shebang → 脚本，不是 grok 本体
-  if head -c 2 "$f" 2>/dev/null | grep -q '#!'; then
-    return 1
-  fi
-  if command -v file >/dev/null 2>&1; then
-    file -b "$f" 2>/dev/null | grep -qi 'ELF' && return 0
-    return 1
-  fi
-  # 无 file 时：读 ELF magic
-  head -c 4 "$f" 2>/dev/null | od -An -tx1 | grep -q '7f 45 4c 46'
+  local f="$1" b
+  [ -n "$f" ] || return 1
+  [ -e "$f" ] || return 1
+  [ -r "$f" ] || return 1
+  # must be executable by us OR world/group (some installs are 755/744)
+  [ -x "$f" ] || return 1
+  b=$(head -c 4 "$f" 2>/dev/null) || return 1
+  # bash string compare with ANSI-C quoting
+  [ "$b" = $'\x7fELF' ]
 }
 
-# 运行时解析真实 Grok 二进制（绝不返回本包装器自身）
 _find_real_grok() {
-  local self c t
-  self="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+  local self c t home
+  home="${HOME:-}"
+  [ -n "$home" ] || home="$(cd ~ && pwd)"
+  self="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+
+  _try() {
+    local p="$1" r
+    [ -n "$p" ] || return 1
+    [ -e "$p" ] || return 1
+    r="$(readlink -f "$p" 2>/dev/null || printf '%s' "$p")"
+    [ "$r" = "$self" ] && return 1
+    _is_elf "$r" || return 1
+    printf '%s' "$r"
+    return 0
+  }
+
+  # 1) explicit override
   if [ -n "${GROK_REAL_BIN:-}" ]; then
-    t="$(readlink -f "$GROK_REAL_BIN" 2>/dev/null || echo "$GROK_REAL_BIN")"
-    if [ "$t" != "$self" ] && _is_elf "$t"; then
-      printf '%s' "$t"
-      return 0
-    fi
+    _try "$GROK_REAL_BIN" && return 0
   fi
+
+  # 2) well-known locations under this HOME (per-studio)
   for c in \
-    "${HOME}/.grok/downloads/grok-linux-x86_64" \
-    "${HOME}/.grok/downloads/grok" \
-    "${HOME}/.grok/bin/grok.real" \
-    "${HOME}/.grok/bin/grok"
+    "$home/.grok/downloads/grok-linux-x86_64" \
+    "$home/.grok/downloads/grok-linux-aarch64" \
+    "$home/.grok/downloads/grok" \
+    "$home/.grok/bin/grok.real" \
+    "$home/.grok/bin/grok" \
+    "$home/.grok/bin/agent"
   do
-    [ -e "$c" ] || continue
-    t="$(readlink -f "$c" 2>/dev/null || echo "$c")"
-    [ "$t" = "$self" ] && continue
-    if _is_elf "$t"; then
-      printf '%s' "$t"
-      return 0
-    fi
+    _try "$c" && return 0
   done
-  # 扫描 downloads 目录
-  if [ -d "${HOME}/.grok/downloads" ]; then
-    # shellcheck disable=SC2044
-    for c in "${HOME}/.grok/downloads"/grok*; do
-      [ -e "$c" ] || continue
-      t="$(readlink -f "$c" 2>/dev/null || echo "$c")"
-      [ "$t" = "$self" ] && continue
-      if _is_elf "$t"; then
-        printf '%s' "$t"
-        return 0
-      fi
+
+  # 3) any grok* ELF in downloads
+  if [ -d "$home/.grok/downloads" ]; then
+    for c in "$home/.grok/downloads"/grok*; do
+      _try "$c" && return 0
     done
   fi
+
+  # 4) PATH entries that are real ELFs (skip our wrapper)
+  local p
+  # shellcheck disable=SC2046
+  for p in $(type -a grok 2>/dev/null | awk '/is /{print $NF}' ; command -v -a grok 2>/dev/null); do
+    _try "$p" && return 0
+  done
+
   return 1
 }
 
 REAL=""
 if ! REAL="$(_find_real_grok)"; then
   echo "grok: 未找到真实 Grok 二进制（ELF）。" >&2
-  echo "  请先安装 Grok Build，或设置: export GROK_REAL_BIN=/path/to/grok-linux-x86_64" >&2
-  echo "  常见路径: \$HOME/.grok/downloads/grok-linux-x86_64" >&2
+  echo "  HOME=${HOME:-<unset>}" >&2
+  echo "  已检查: \$HOME/.grok/downloads/grok-linux-* 与 \$HOME/.grok/bin/grok" >&2
+  if [ -d "${HOME}/.grok/downloads" ]; then
+    echo "  downloads 目录内容:" >&2
+    ls -la "${HOME}/.grok/downloads" 2>&1 | sed 's/^/    /' >&2 || true
+  else
+    echo "  不存在: ${HOME}/.grok/downloads  （请先安装 Grok Build）" >&2
+  fi
+  if [ -d "${HOME}/.grok/bin" ]; then
+    echo "  bin 目录内容:" >&2
+    ls -la "${HOME}/.grok/bin" 2>&1 | sed 's/^/    /' >&2 || true
+  fi
+  echo "  或设置: export GROK_REAL_BIN=/绝对路径/grok-linux-x86_64" >&2
   exit 127
 fi
 
 FILTER="${GROK_MOUSE_FILTER:-${HOME}/.local/bin/grok-mouse-filter.py}"
 
-# 显式绕过过滤器 / 非交互
 if [ "${GROK_ALLOW_MOUSE:-0}" = "1" ]; then
   exec "$REAL" "$@"
 fi
 
-# 非 TUI 子命令：直接透传（安装、login、--version 等绝不能卡在 PTY 过滤器里）
+# Non-TUI: always pass through
 case "${1-}" in
   -h|--help|-v|--version|agent|completions|export|help|inspect|leader|login|logout|mcp|memory|models|plugin|sessions|setup|trace|update|version|worktree|wrap)
     exec "$REAL" "$@"
@@ -732,34 +722,37 @@ for _arg in "$@"; do
   esac
 done
 
-# 无 TTY（管道/CI/agent）：不过滤
+# No TTY → direct
 if [ ! -t 0 ] || [ ! -t 1 ]; then
   exec "$REAL" "$@"
 fi
 
-# 过滤器或系统 Python 不可用：降级直连，保证 grok 一定能开
 if [ ! -f "$FILTER" ]; then
-  echo "grok: 警告: 找不到鼠标过滤器 $FILTER，直连启动" >&2
   exec "$REAL" "$@"
 fi
 PY="$(_find_python || true)"
 if [ -z "${PY:-}" ]; then
-  echo "grok: 警告: 找不到可用的系统 python3，直连启动（可能再次出现鼠标乱码）" >&2
+  echo "grok: 警告: 无系统 python3，直连 Grok（可能有鼠标乱码）" >&2
   exec "$REAL" "$@"
 fi
 
 exec "$PY" "$FILTER" "$REAL" "$@"
-EOF
+WRAP
   chmod +x "$GROK_WRAPPER_LOCAL"
-  log "Wrote $GROK_WRAPPER_LOCAL (runtime-resolving smart wrapper)"
+  log "Wrote $GROK_WRAPPER_LOCAL (v2.2 runtime ELF magic detection)"
 
-  # 不修改 Grok 自行管理的 ~/.grok/bin/{grok,agent}。
+  # Smoke: if binary exists, --version must work
+  if real="$(resolve_grok_real)"; then
+    if "$GROK_WRAPPER_LOCAL" --version >/dev/null 2>&1; then
+      log "Smoke OK: grok --version via wrapper"
+    else
+      warn "Smoke FAILED: wrapper could not run --version (see grok --version manually)"
+    fi
+  fi
 }
 
 # ---------------------------------------------------------------------------
-# Shell 启动脚本以及 vim、screen、tmux、Grok 配置
-# ---------------------------------------------------------------------------
-install_shell_rc_hooks() {
+# Shellinstall_shell_rc_hooks() {
   local body
   body=$(cat <<EOF
 # 在 Lightning 启动脚本设置 LESS=...--mouse... 后进行清理并关闭鼠标模式。
