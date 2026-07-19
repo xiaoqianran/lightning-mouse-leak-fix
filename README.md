@@ -46,6 +46,7 @@ bash fix-lightning-mouse-leak.sh --check
 5. **选择性 Grok 包装器**——只有交互式 TUI/dashboard 会使用 PTY 过滤器；无界面模式及所有管理子命令均直接执行真实二进制文件。
 6. **安全协议过滤器**——将鼠标“启用”CSI 改写为“禁用”，只剥离带 ESC 前缀的明确鼠标报告，同时保留焦点事件、OSC 52、括号粘贴、Kitty/CSI 按键及普通文本。
 7. **Grok 自主管理程序文件**——不替换 `~/.grok/bin/grok` 和 `agent`，确保 `update`、补全以及基于 `argv` 的入口分派正常工作。
+8. **防覆盖保证**——`~/.local/bin/grok` 通过同目录临时文件原子替换；即使该路径原本是指向 Grok ELF 的符号链接，也只替换链接本身，绝不沿链接写坏真实二进制。安装前后还会核对 ELF 的 inode、大小、时间戳和 magic。
 
 ## 命令行用法
 
@@ -81,6 +82,7 @@ env -u OPENCODE_DISABLE_MOUSE opencode
 ```bash
 python3 tests/test_mouse_filter.py
 bash tests/test_installer.sh
+bash tests/test_install_safety.sh
 ```
 
 脚本只使用 `$HOME`，可以安全地重复运行（通过标记块保证幂等）。
@@ -171,7 +173,7 @@ Open a new terminal tab or run `reset`.
 
 ### downloads 里有 `grok-linux-x86_64` 但仍报未找到 ELF
 
-看文件大小：真身一般 **> 50MB**。若只有几 KB（例如 **3613**），那是 shell 脚本被误当成二进制（包装器或错误拷贝），不是 zsh 问题。
+看文件大小：真身一般 **> 50MB**。若只有几 KB（例如 **3613**），说明 shell 包装器曾经沿符号链接写进了二进制路径；早期手工安装步骤存在这个风险。这不是 zsh 导致的。v2.4 改为原子替换并加入真实 ELF 不变性检查，已从机制上阻断同类覆盖。
 
 ```bash
 wc -c ~/.grok/downloads/grok-linux-x86_64

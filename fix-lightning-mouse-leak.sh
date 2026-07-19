@@ -46,7 +46,7 @@
 # =============================================================================
 set -euo pipefail
 
-VERSION="2.3.0"
+VERSION="2.4.0"
 MARKER_BEGIN="# >>> mouse-leak fix (lightning) >>>"
 MARKER_END="# <<< mouse-leak fix (lightning) <<<"
 # 首版 Studio 修复所用的旧标记，仍按“已安装”处理
@@ -103,8 +103,8 @@ GROK_REAL_CANDIDATES=(
   "$HOME/.grok/downloads/grok"
   "$GROK_BIN_DIR/grok.real"
 )
-LIGHTNING_SCREENRC="/settings/.screenrc"
-LIGHTNING_RC="/settings/.lightningrc"
+LIGHTNING_SCREENRC="${LIGHTNING_SCREENRC:-/settings/.screenrc}"
+LIGHTNING_RC="${LIGHTNING_RC:-/settings/.lightningrc}"
 
 need_cmd() { command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"; }
 
@@ -153,6 +153,33 @@ apply_now() {
 # 文件安装辅助函数（幂等标记块）
 # ---------------------------------------------------------------------------
 ensure_dir() { mkdir -p "$1"; }
+
+# Replace the directory entry itself instead of opening the destination for
+# writing. This is security- and data-safety-critical: ~/.local is shared by
+# Lightning Studios and ~/.local/bin/grok may be a symlink. A plain
+# `cp source "$GROK_WRAPPER_LOCAL"` would follow that symlink and could
+# overwrite the vendor ELF that it points to.
+atomic_install_file() {
+  local src="$1" dst="$2" mode="${3:-755}" tmp
+  tmp="${dst}.tmp.$$"
+  rm -f "$tmp"
+  cp "$src" "$tmp"
+  chmod "$mode" "$tmp"
+  mv -f "$tmp" "$dst"
+}
+
+is_elf_file() {
+  local f="$1" magic
+  [ -f "$f" ] && [ -r "$f" ] && [ -x "$f" ] || return 1
+  magic="$(LC_ALL=C head -c 4 "$f" 2>/dev/null)" || return 1
+  [ "$magic" = $'\x7fELF' ]
+}
+
+file_identity() {
+  # Follow symlinks: an accidental write through ~/.local/bin/grok changes
+  # the target's size/mtime even though the symlink itself looks unchanged.
+  stat -Lc '%d:%i:%s:%Y' "$1" 2>/dev/null
+}
 
 backup_file() {
   local f="$1"
@@ -548,16 +575,7 @@ PY
 resolve_grok_real() {
   local c
   for c in "${GROK_REAL_CANDIDATES[@]}"; do
-    if [ -f "$c" ] && [ -x "$c" ]; then
-      # 如果是本工具生成的包装脚本，则跳过
-      if head -1 "$c" 2>/dev/null | grep -q 'python\|bash'; then
-        # 可能是包装器，只接受 ELF 文件
-        if file "$c" 2>/dev/null | grep -qi 'ELF'; then
-          printf '%s' "$c"
-          return 0
-        fi
-        continue
-      fi
+    if is_elf_file "$c"; then
       printf '%s' "$c"
       return 0
     fi
@@ -566,7 +584,7 @@ resolve_grok_real() {
   if [ -L "$GROK_BIN_DIR/grok" ]; then
     local t
     t="$(readlink -f "$GROK_BIN_DIR/grok" 2>/dev/null || true)"
-    if [ -n "$t" ] && [ -x "$t" ] && file "$t" 2>/dev/null | grep -qi 'ELF'; then
+    if [ -n "$t" ] && is_elf_file "$t"; then
       printf '%s' "$t"
       return 0
     fi
@@ -574,7 +592,7 @@ resolve_grok_real() {
   # 搜索下载目录
   if [ -d "$HOME/.grok/downloads" ]; then
     c="$(find "$HOME/.grok/downloads" -type f -name 'grok*' -perm -111 2>/dev/null | head -1 || true)"
-    if [ -n "$c" ] && file "$c" 2>/dev/null | grep -qi 'ELF'; then
+    if [ -n "$c" ] && is_elf_file "$c"; then
       printf '%s' "$c"
       return 0
     fi
@@ -583,8 +601,11 @@ resolve_grok_real() {
 }
 
 install_grok_wrappers() {
+  local real="" real_id_before="" real_id_after=""
   ensure_dir "$LOCAL_BIN"
   if real="$(resolve_grok_real)"; then
+    real="$(readlink -f "$real" 2>/dev/null || printf '%s' "$real")"
+    real_id_before="$(file_identity "$real")"
     log "Found Grok binary: $real ($(wc -c <"$real" | tr -d ' ') bytes)"
   else
     warn "Grok binary not found yet (or not a real ELF) — installing smart wrapper anyway"
@@ -602,9 +623,17 @@ install_grok_wrappers() {
   if [ ! -f "$src_wrap" ]; then
     die "missing $src_wrap (re-clone https://github.com/xiaoqianran/lightning-mouse-leak-fix)"
   fi
-  cp "$src_wrap" "$GROK_WRAPPER_LOCAL"
-  chmod +x "$GROK_WRAPPER_LOCAL"
-  log "Wrote $GROK_WRAPPER_LOCAL (v2.3)"
+  atomic_install_file "$src_wrap" "$GROK_WRAPPER_LOCAL" 755
+  log "Wrote $GROK_WRAPPER_LOCAL atomically (v2.4; symlinks are not followed)"
+
+  if [ -n "$real" ]; then
+    real_id_after="$(file_identity "$real")"
+    [ "$real_id_after" = "$real_id_before" ] \
+      || die "SAFETY CHECK FAILED: Grok ELF changed during wrapper install: $real"
+    is_elf_file "$real" \
+      || die "SAFETY CHECK FAILED: Grok binary is no longer an ELF: $real"
+    log "Safety OK: vendor Grok ELF was not modified"
+  fi
 
   local cand="$HOME/.grok/downloads/grok-linux-x86_64"
   if [ -e "$cand" ]; then
@@ -895,6 +924,7 @@ main() {
   need_cmd python3
   need_cmd awk
   need_cmd file
+  need_cmd stat
 
   if [ -f "$LIGHTNING_RC" ]; then
     log "Detected Lightning rc: $LIGHTNING_RC"
