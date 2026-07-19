@@ -1,5 +1,8 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """PTY 包装器：阻止 TUI 应用（Grok）启用终端鼠标追踪。
+
+注意：请用系统 /usr/bin/python3 运行。Lightning 的 /commands/python3 或
+conda 环境的 python 偶发会在 import 标准库时卡住，导致 `grok` 打不开。
 
 在 Lightning Studio（code-server + GNU screen）中，Grok 发出的鼠标启用 CSI
 会使每次鼠标移动都以 ``80;5M79;5M...`` 一类文本泄漏到输入框中。

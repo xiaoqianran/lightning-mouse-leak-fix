@@ -88,3 +88,47 @@ bash tests/test_installer.sh
 ## 许可证
 
 MIT
+
+## Troubleshooting
+
+### `grok` hangs / Ctrl+C shows traceback in `grok-mouse-filter.py` / `import signal`
+
+**Cause (v2.0 and earlier):** the wrapper called PATH `python3` (often Lightning
+`/commands/python3` or conda), which can hang on import; or the real binary path
+was baked in at install time before Grok was downloaded.
+
+**Fix:** upgrade to **v2.1+** and re-run:
+
+```bash
+git pull
+bash fix-lightning-mouse-leak.sh
+```
+
+Emergency bypass (always works if Grok is installed):
+
+```bash
+# option A
+GROK_ALLOW_MOUSE=1 grok
+
+# option B — call the real binary directly
+~/.grok/downloads/grok-linux-x86_64
+# or
+~/.grok/bin/grok
+```
+
+### Installed the fix **before** downloading Grok
+
+v2.1+ wrappers resolve the ELF **at runtime**. After Grok finishes installing:
+
+```bash
+bash fix-lightning-mouse-leak.sh   # refresh optional
+grok --version                     # should print version, not hang
+```
+
+### Still broken
+
+```bash
+rm -f ~/.local/bin/grok            # remove PATH shadow
+hash -r
+~/.grok/bin/grok                   # vendor entry
+```

@@ -46,7 +46,7 @@
 # =============================================================================
 set -euo pipefail
 
-VERSION="2.0.0"
+VERSION="2.1.0"
 MARKER_BEGIN="# >>> mouse-leak fix (lightning) >>>"
 MARKER_END="# <<< mouse-leak fix (lightning) <<<"
 # 首版 Studio 修复所用的旧标记，仍按“已安装”处理
@@ -600,57 +600,160 @@ install_grok_wrappers() {
   if real="$(resolve_grok_real)"; then
     log "Found Grok binary: $real"
   else
-    warn "Grok binary not found — installing filter + wrappers for when Grok is installed later"
-    real="$HOME/.grok/downloads/grok-linux-x86_64"
+    warn "Grok binary not found yet — installing a smart wrapper that resolves at runtime"
+    real=""
   fi
 
-  # v1 曾替换程序自带入口。这里执行一次迁移恢复，之后完全交由 Grok 更新器管理。
-  # 只处理带有本工具精确标记的文件。
+  # v1 曾替换程序自带入口。迁移恢复后交由 Grok 更新器管理 ~/.grok/bin。
   if [ -f "$GROK_BIN_DIR/grok" ] && grep -q 'mouse-leak PTY filter' "$GROK_BIN_DIR/grok" 2>/dev/null; then
     rm -f "$GROK_BIN_DIR/grok"
-    ln -s "$real" "$GROK_BIN_DIR/grok"
+    if [ -n "$real" ]; then
+      ln -sfn "$real" "$GROK_BIN_DIR/grok"
+    fi
     log "Restored vendor Grok entrypoint (v1 migration)"
   fi
   if [ -f "$GROK_BIN_DIR/agent" ] && grep -q 'mouse-leak PTY filter' "$GROK_BIN_DIR/agent" 2>/dev/null; then
     rm -f "$GROK_BIN_DIR/agent"
-    ln -s grok "$GROK_BIN_DIR/agent"
+    ln -sfn grok "$GROK_BIN_DIR/agent" 2>/dev/null || true
     log "Restored vendor agent entrypoint (v1 migration)"
   fi
 
-  # 本地 PATH 包装器（加载钩子后始终位于 PATH 最前方）
-  cat >"$GROK_WRAPPER_LOCAL" <<EOF
+  # 智能 PATH 包装器：
+  # - 运行时查找真实 ELF（先装 fix 后装 grok 也能用）
+  # - 强制系统 Python，避开 conda//commands/python3 卡住
+  # - 过滤器失败时回退直连真实二进制
+  cat >"$GROK_WRAPPER_LOCAL" <<'EOF'
 #!/usr/bin/env bash
-# 带鼠标乱码 PTY 过滤器的 Grok 入口（fix-lightning-mouse-leak.sh）
+# 带鼠标乱码 PTY 过滤器的 Grok 入口（fix-lightning-mouse-leak.sh v2.1）
+# 运行时解析真实二进制；可在 Grok 尚未安装时先部署本包装器。
 set -euo pipefail
-REAL="\${GROK_REAL_BIN:-$real}"
-FILTER="\${GROK_MOUSE_FILTER:-$FILTER_PY}"
-if [ "\${GROK_ALLOW_MOUSE:-0}" = "1" ]; then
-  exec "\$REAL" "\$@"
-fi
-if [ ! -x "\$REAL" ]; then
-  echo "grok: real binary not found at \$REAL" >&2
-  echo "Set GROK_REAL_BIN=/path/to/grok-linux-x86_64" >&2
+
+# 查找系统 Python（不要用 PATH 里的 conda 或 /commands/python3，偶发卡死在 import）
+_find_python() {
+  local p
+  for p in /usr/bin/python3 /bin/python3; do
+    if [ -x "$p" ]; then
+      printf '%s' "$p"
+      return 0
+    fi
+  done
+  # 最后才退回 PATH，但仍排除明显的 conda envs
+  p="$(command -v python3 2>/dev/null || true)"
+  case "$p" in
+    *miniconda*|*anaconda*|*conda/envs*|/commands/python*)
+      return 1 ;;
+  esac
+  [ -n "$p" ] && [ -x "$p" ] && printf '%s' "$p"
+}
+
+# 判断是否为 ELF 可执行文件（排除 bash/python 包装脚本）
+_is_elf() {
+  local f="$1"
+  [ -f "$f" ] && [ -x "$f" ] || return 1
+  # shebang → 脚本，不是 grok 本体
+  if head -c 2 "$f" 2>/dev/null | grep -q '#!'; then
+    return 1
+  fi
+  if command -v file >/dev/null 2>&1; then
+    file -b "$f" 2>/dev/null | grep -qi 'ELF' && return 0
+    return 1
+  fi
+  # 无 file 时：读 ELF magic
+  head -c 4 "$f" 2>/dev/null | od -An -tx1 | grep -q '7f 45 4c 46'
+}
+
+# 运行时解析真实 Grok 二进制（绝不返回本包装器自身）
+_find_real_grok() {
+  local self c t
+  self="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+  if [ -n "${GROK_REAL_BIN:-}" ]; then
+    t="$(readlink -f "$GROK_REAL_BIN" 2>/dev/null || echo "$GROK_REAL_BIN")"
+    if [ "$t" != "$self" ] && _is_elf "$t"; then
+      printf '%s' "$t"
+      return 0
+    fi
+  fi
+  for c in \
+    "${HOME}/.grok/downloads/grok-linux-x86_64" \
+    "${HOME}/.grok/downloads/grok" \
+    "${HOME}/.grok/bin/grok.real" \
+    "${HOME}/.grok/bin/grok"
+  do
+    [ -e "$c" ] || continue
+    t="$(readlink -f "$c" 2>/dev/null || echo "$c")"
+    [ "$t" = "$self" ] && continue
+    if _is_elf "$t"; then
+      printf '%s' "$t"
+      return 0
+    fi
+  done
+  # 扫描 downloads 目录
+  if [ -d "${HOME}/.grok/downloads" ]; then
+    # shellcheck disable=SC2044
+    for c in "${HOME}/.grok/downloads"/grok*; do
+      [ -e "$c" ] || continue
+      t="$(readlink -f "$c" 2>/dev/null || echo "$c")"
+      [ "$t" = "$self" ] && continue
+      if _is_elf "$t"; then
+        printf '%s' "$t"
+        return 0
+      fi
+    done
+  fi
+  return 1
+}
+
+REAL=""
+if ! REAL="$(_find_real_grok)"; then
+  echo "grok: 未找到真实 Grok 二进制（ELF）。" >&2
+  echo "  请先安装 Grok Build，或设置: export GROK_REAL_BIN=/path/to/grok-linux-x86_64" >&2
+  echo "  常见路径: \$HOME/.grok/downloads/grok-linux-x86_64" >&2
   exit 127
 fi
-# 对所有非 TUI 命令和无界面模式保持逐字节一致的 CLI 行为。
-# 只有全屏界面和 dashboard 需要 PTY 鼠标防护。
-case "\${1-}" in
+
+FILTER="${GROK_MOUSE_FILTER:-${HOME}/.local/bin/grok-mouse-filter.py}"
+
+# 显式绕过过滤器 / 非交互
+if [ "${GROK_ALLOW_MOUSE:-0}" = "1" ]; then
+  exec "$REAL" "$@"
+fi
+
+# 非 TUI 子命令：直接透传（安装、login、--version 等绝不能卡在 PTY 过滤器里）
+case "${1-}" in
   -h|--help|-v|--version|agent|completions|export|help|inspect|leader|login|logout|mcp|memory|models|plugin|sessions|setup|trace|update|version|worktree|wrap)
-    exec "\$REAL" "\$@" ;;
+    exec "$REAL" "$@"
+    ;;
 esac
-for _arg in "\$@"; do
-  case "\$_arg" in
+for _arg in "$@"; do
+  case "$_arg" in
     -p|--single|--single=*|--prompt-file|--prompt-file=*|--prompt-json|--prompt-json=*|--json-schema|--json-schema=*)
-      exec "\$REAL" "\$@" ;;
+      exec "$REAL" "$@"
+      ;;
   esac
 done
-exec python3 "\$FILTER" "\$REAL" "\$@"
+
+# 无 TTY（管道/CI/agent）：不过滤
+if [ ! -t 0 ] || [ ! -t 1 ]; then
+  exec "$REAL" "$@"
+fi
+
+# 过滤器或系统 Python 不可用：降级直连，保证 grok 一定能开
+if [ ! -f "$FILTER" ]; then
+  echo "grok: 警告: 找不到鼠标过滤器 $FILTER，直连启动" >&2
+  exec "$REAL" "$@"
+fi
+PY="$(_find_python || true)"
+if [ -z "${PY:-}" ]; then
+  echo "grok: 警告: 找不到可用的系统 python3，直连启动（可能再次出现鼠标乱码）" >&2
+  exec "$REAL" "$@"
+fi
+
+exec "$PY" "$FILTER" "$REAL" "$@"
 EOF
   chmod +x "$GROK_WRAPPER_LOCAL"
-  log "Wrote $GROK_WRAPPER_LOCAL"
+  log "Wrote $GROK_WRAPPER_LOCAL (runtime-resolving smart wrapper)"
 
-  # 不修改 Grok 自行管理的 ~/.grok/bin/{grok,agent}。这样不会影响 Grok 更新和
-  # agent 的 argv[0] 分派；PATH 包装器已经足够。
+  # 不修改 Grok 自行管理的 ~/.grok/bin/{grok,agent}。
 }
 
 # ---------------------------------------------------------------------------
