@@ -127,14 +127,48 @@ bash fix-lightning-mouse-leak.sh   # refresh optional
 grok --version                     # should print version, not hang
 ```
 
-### Still broken
+### Still broken after `--check` PASSED (v2.5 diagnosis)
+
+**This is the most common residual failure.** Install and `--check` only prove
+files/hooks on disk (and, from v2.5, that the entry is a real filtered wrapper).
+They do **not** rewrite an already-running Grok TUI or an old shell’s environment.
+
+Root causes observed on Lightning (v2.1–v2.4 history + live PIDs):
+
+| Symptom | Cause | Fix |
+|--------|--------|-----|
+| Mouse garbage in an open Grok TUI | Process is the **bare vendor ELF** under zsh (no python `grok-mouse-filter` parent). Install cannot hot-patch that PID. | Exit Grok (`/exit` or Ctrl+C), then `hash -r` and run `grok` again. |
+| `LESS` still has `--mouse` | Long-lived screen/zsh started **before** hooks; never re-sourced. | `source ~/.zshrc` or new tab; or `bash fix-lightning-mouse-leak.sh --now`. |
+| `command -v grok` → `~/.grok/bin/grok` | Vendor bin earlier on `PATH`, or **zsh hash** cached the ELF from a pre-install run. | v2.5 installs a `grok()` function that always runs `~/.local/bin/grok`. New shell or re-source; `hash -r`. |
+| Old `--check` false-PASS | v2.4 and earlier: `head -5 \| grep FILTER\|mouse-filter` missed the wrapper header; `file` on a **symlink** to the ELF said “symbolic link” not “ELF”, so check printed “check manually” and **PASSED**. | Upgrade to **v2.5+** (`mouse-leak-filter-entry` identity; ELF magic via `readlink`/`head -c 4`). |
 
 ```bash
-rm -f ~/.local/bin/grok            # remove PATH shadow
+# 1) re-install / upgrade
+git pull
+bash fix-lightning-mouse-leak.sh
+bash fix-lightning-mouse-leak.sh --check   # must PASS only for filtered entry
+
+# 2) refresh THIS shell (or open a new terminal)
 hash -r
-~/.grok/bin/grok                   # vendor entry
+source ~/.zshrc 2>/dev/null || source ~/.bashrc
+
+# 3) prove launch path (should be the shell wrapper, not a bare ELF)
+type grok
+command -v grok
+head -3 "$(command -v grok 2>/dev/null || echo "$HOME/.local/bin/grok")"
+# expect: mouse-leak-filter-entry
+
+# 4) restart Grok TUI if it was already running
+# (check may PASS while PID still is unfiltered — exit that session first)
 ```
 
+Emergency: drop PATH shadow and call vendor binary (mouse leak returns):
+
+```bash
+rm -f ~/.local/bin/grok
+hash -r
+~/.grok/bin/grok
+```
 
 ### `grok: 未找到真实 Grok 二进制（ELF）`
 
@@ -173,7 +207,7 @@ Open a new terminal tab or run `reset`.
 
 ### downloads 里有 `grok-linux-x86_64` 但仍报未找到 ELF
 
-看文件大小：真身一般 **> 50MB**。若只有几 KB（例如 **3613**），说明 shell 包装器曾经沿符号链接写进了二进制路径；早期手工安装步骤存在这个风险。这不是 zsh 导致的。v2.4 改为原子替换并加入真实 ELF 不变性检查，已从机制上阻断同类覆盖。
+看文件大小：真身一般 **> 50MB**。若只有几 KB（例如 **3613**），说明 shell 包装器曾经沿符号链接写进了二进制路径；早期手工安装步骤存在这个风险。这不是 zsh 导致的。v2.4 改为原子替换并加入真实 ELF 不变性检查；v2.5 起 `--check` 用 `mouse-leak-filter-entry` 身份标记并正确拒绝 symlink→ELF，已从机制上阻断同类覆盖与假阳性。
 
 ```bash
 wc -c ~/.grok/downloads/grok-linux-x86_64

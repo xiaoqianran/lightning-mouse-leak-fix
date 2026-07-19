@@ -46,7 +46,9 @@
 # =============================================================================
 set -euo pipefail
 
-VERSION="2.4.0"
+VERSION="2.5.0"
+# Must appear in grok-wrapper.sh header; --check requires this (not bare ELF).
+WRAPPER_IDENTITY="mouse-leak-filter-entry"
 MARKER_BEGIN="# >>> mouse-leak fix (lightning) >>>"
 MARKER_END="# <<< mouse-leak fix (lightning) <<<"
 # 首版 Studio 修复所用的旧标记，仍按“已安装”处理
@@ -116,6 +118,62 @@ mouse_off_bytes() {
   printf '\033[?9l\033[?1000l\033[?1001l\033[?1002l\033[?1003l\033[?1005l\033[?1006l\033[?1007l\033[?1015l\033[?1016l'
 }
 
+# True when path is a filtered shell wrapper (identity marker), not a bare ELF.
+is_filtered_grok_entry() {
+  local g="$1"
+  [ -n "$g" ] && [ -e "$g" ] && [ -r "$g" ] || return 1
+  # Symlink to vendor ELF must fail (file without -L often says "symbolic link").
+  if is_elf_file "$g"; then
+    return 1
+  fi
+  # Also reject if resolved target is ELF (broken wrapper that is a symlink chain).
+  local resolved
+  resolved="$(readlink -f "$g" 2>/dev/null || printf '%s' "$g")"
+  if [ -n "$resolved" ] && [ "$resolved" != "$g" ] && is_elf_file "$resolved"; then
+    return 1
+  fi
+  grep -q "$WRAPPER_IDENTITY" "$g" 2>/dev/null
+}
+
+# List PIDs of running grok processes that are NOT under the PTY filter parent.
+# Prints one "pid|exe|ppid|parent_comm" line per unfiltered process.
+list_unfiltered_grok_pids() {
+  local pid exe ppid pcomm cmdline
+  for pid in $(ps -eo pid=,comm= 2>/dev/null | awk '$2=="grok"{print $1}'); do
+    [ -r "/proc/$pid/exe" ] || continue
+    exe="$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)"
+    [ -n "$exe" ] || continue
+    # Filter parent is python running grok-mouse-filter; child ELF is OK.
+    ppid="$(awk '/^PPid:/{print $2}' "/proc/$pid/status" 2>/dev/null || true)"
+    pcomm=""
+    if [ -n "$ppid" ] && [ -r "/proc/$ppid/cmdline" ]; then
+      cmdline="$(tr '\0' ' ' <"/proc/$ppid/cmdline" 2>/dev/null || true)"
+      case "$cmdline" in
+        *grok-mouse-filter*) continue ;;  # filtered child — good
+      esac
+      pcomm="$(cat "/proc/$ppid/comm" 2>/dev/null || true)"
+    fi
+    # Top-level process that is the vendor ELF (or named grok) without filter parent
+    if is_elf_file "$exe" || [[ "$exe" == *grok* ]]; then
+      printf '%s|%s|%s|%s\n' "$pid" "$exe" "${ppid:-?}" "${pcomm:-?}"
+    fi
+  done
+}
+
+warn_running_unfiltered_grok() {
+  local line count=0
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    count=$((count + 1))
+    warn "Running unfiltered Grok (must restart): $line"
+  done < <(list_unfiltered_grok_pids || true)
+  if [ "$count" -gt 0 ]; then
+    warn "Exit those Grok sessions (/exit or Ctrl+C), then run: hash -r; grok"
+    warn "Already-running unfiltered TUI cannot be hot-patched."
+  fi
+  return 0
+}
+
 apply_now() {
   log "Emitting mouse-off CSI (only to real /dev/tty — never spray all PTYs)"
   local payload
@@ -131,6 +189,7 @@ apply_now() {
       [ -e "$sock" ] || continue
       name="$(basename "$sock")"
       screen -S "$name" -X eval 'mousetrack off' 2>/dev/null || true
+      log "screen mousetrack off: $name"
     done
   fi
   if [ -n "${LESS-}" ]; then
@@ -145,6 +204,14 @@ apply_now() {
     export LESS
     log "Sanitized LESS for this process: ${LESS:-<empty>}"
   fi
+  export OPENCODE_DISABLE_MOUSE=1
+  log "Set OPENCODE_DISABLE_MOUSE=1 for this process"
+  # Prefer filtered entry in *this* shell; hash -r so PATH picks up new wrapper.
+  if [ -x "$GROK_WRAPPER_LOCAL" ]; then
+    hash -r 2>/dev/null || true
+    log "PATH tip: ensure $LOCAL_BIN is before $GROK_BIN_DIR (hooks do this in new shells)"
+  fi
+  warn_running_unfiltered_grok
   log "Immediate mouse-off applied"
 }
 
@@ -624,7 +691,10 @@ install_grok_wrappers() {
     die "missing $src_wrap (re-clone https://github.com/xiaoqianran/lightning-mouse-leak-fix)"
   fi
   atomic_install_file "$src_wrap" "$GROK_WRAPPER_LOCAL" 755
-  log "Wrote $GROK_WRAPPER_LOCAL atomically (v2.4; symlinks are not followed)"
+  if ! is_filtered_grok_entry "$GROK_WRAPPER_LOCAL"; then
+    die "installed wrapper missing identity marker '$WRAPPER_IDENTITY': $GROK_WRAPPER_LOCAL"
+  fi
+  log "Wrote $GROK_WRAPPER_LOCAL atomically (v$VERSION; symlinks are not followed)"
 
   if [ -n "$real" ]; then
     real_id_after="$(file_identity "$real")"
@@ -671,6 +741,14 @@ export PATH="\$HOME/.local/bin:\$HOME/.grok/bin:\$PATH"
 # OpenCode 提供原生开关。无需增加额外 PTY，即可保留 attach、run、serve、
 # ACP/MCP、插件、管道、剪贴板及键盘协议。
 export OPENCODE_DISABLE_MOUSE=1
+# Absolute-path grok() bypasses zsh/bash command hash and PATH order so that
+# interactive \`grok\` always hits the PTY filter wrapper (not ~/.grok/bin ELF).
+if [ -x "\$HOME/.local/bin/grok" ]; then
+  grok() {
+    "\$HOME/.local/bin/grok" "\$@"
+  }
+fi
+hash -r 2>/dev/null || true
 EOF
 )
   for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
@@ -813,16 +891,28 @@ for m in (1000, 1002, 1003, 1005, 1006, 1015):
 print("filter self-test OK")
 PY
 
-  # 包装器必须引用过滤器
-  grep -q 'grok-mouse-filter\|FILTER' "$GROK_WRAPPER_LOCAL" || die "local grok wrapper missing filter"
-  # 新 Shell 中的 LESS
+  # 包装器必须带身份标记并引用过滤器（禁止仅靠 head -5 弱匹配）
+  is_filtered_grok_entry "$GROK_WRAPPER_LOCAL" \
+    || die "local grok wrapper missing identity '$WRAPPER_IDENTITY': $GROK_WRAPPER_LOCAL"
+  grep -q 'grok-mouse-filter' "$GROK_WRAPPER_LOCAL" || die "local grok wrapper missing filter path"
+  # 新 Shell 中的 LESS / OPENCODE / grok 解析
   if command -v zsh >/dev/null 2>&1; then
-    local less_z
+    local less_z oc_z g_z
     less_z="$(zsh -ic 'echo $LESS' 2>/dev/null | tail -1 || true)"
     case "$less_z" in
       *--mouse*) die "fresh zsh still has LESS --mouse: $less_z" ;;
     esac
-    log "fresh zsh LESS OK: ${less_z:-<empty>}"
+    oc_z="$(zsh -ic 'echo $OPENCODE_DISABLE_MOUSE' 2>/dev/null | tail -1 || true)"
+    [ "$oc_z" = "1" ] || die "fresh zsh OPENCODE_DISABLE_MOUSE != 1: [$oc_z]"
+    g_z="$(zsh -ic 'command -v grok' 2>/dev/null | tail -1 || true)"
+    # With grok() function, command -v may print the function; resolve via type -a / absolute.
+    if ! zsh -ic '[ -x "$HOME/.local/bin/grok" ] && grok(){ "$HOME/.local/bin/grok" "$@"; }; type grok' 2>/dev/null | grep -q function; then
+      # Fall back: PATH entry must be filtered
+      if [ -n "$g_z" ] && [ -e "$g_z" ]; then
+        is_filtered_grok_entry "$g_z" || die "fresh zsh grok is not filtered entry: $g_z"
+      fi
+    fi
+    log "fresh zsh LESS OK: ${less_z:-<empty>}; OPENCODE=$oc_z"
   fi
   log "Self-test PASSED"
 }
@@ -832,41 +922,86 @@ PY
 # ---------------------------------------------------------------------------
 run_check() {
   local fail=0
-  check() {
-    if "$@"; then log "OK: $*"; else warn "FAIL: $*"; fail=1; fi
-  }
   [ -f "$GUARD_SH" ] && log "OK: $GUARD_SH" || { warn "missing $GUARD_SH"; fail=1; }
   [ -x "$FILTER_PY" ] && log "OK: $FILTER_PY" || { warn "missing $FILTER_PY"; fail=1; }
   [ -x "$MOUSE_OFF_BIN" ] && log "OK: $MOUSE_OFF_BIN" || { warn "missing $MOUSE_OFF_BIN"; fail=1; }
-  [ -x "$GROK_WRAPPER_LOCAL" ] && log "OK: $GROK_WRAPPER_LOCAL" || { warn "missing wrapper"; fail=1; }
+  if [ -x "$GROK_WRAPPER_LOCAL" ] && is_filtered_grok_entry "$GROK_WRAPPER_LOCAL"; then
+    log "OK: filtered wrapper $GROK_WRAPPER_LOCAL"
+  else
+    warn "FAIL: missing or unfiltered wrapper at $GROK_WRAPPER_LOCAL"
+    fail=1
+  fi
   if [ -f "$HOME/.zshrc" ] && grep -q 'mouse-leak-guard\|mouse-leak fix' "$HOME/.zshrc"; then
     log "OK: .zshrc hooked"
   else
     warn "FAIL: .zshrc not hooked"; fail=1
   fi
+  if [ -f "$HOME/.zshrc" ] && grep -q 'grok()' "$HOME/.zshrc" 2>/dev/null; then
+    log "OK: .zshrc defines grok() absolute entry"
+  else
+    warn "FAIL: .zshrc missing grok() function (re-run install)"; fail=1
+  fi
   if [ -f "$LIGHTNING_SCREENRC" ]; then
     grep -q 'mousetrack off' "$LIGHTNING_SCREENRC" && log "OK: lightning screenrc" || warn "lightning screenrc missing mousetrack off"
   fi
   if command -v zsh >/dev/null 2>&1; then
-    local less_z
+    local less_z oc_z
     less_z="$(zsh -ic 'echo $LESS' 2>/dev/null | tail -1 || true)"
     case "$less_z" in
       *--mouse*) warn "FAIL: LESS still has --mouse ($less_z)"; fail=1 ;;
       *) log "OK: LESS has no --mouse ($less_z)" ;;
     esac
+    oc_z="$(zsh -ic 'echo ${OPENCODE_DISABLE_MOUSE-}' 2>/dev/null | tail -1 || true)"
+    if [ "$oc_z" = "1" ]; then
+      log "OK: OPENCODE_DISABLE_MOUSE=1"
+    else
+      warn "FAIL: fresh shell OPENCODE_DISABLE_MOUSE is [$oc_z] (want 1)"; fail=1
+    fi
   fi
-  # 检查实际使用的 Grok
-  if command -v grok >/dev/null 2>&1; then
-    local g
+  # What does `grok` resolve to under a PATH shaped like post-install interactive shells?
+  # Prefer absolute filtered entry; reject bare ELF and symlink-to-ELF (old false-PASS).
+  local g=""
+  if [ -x "$GROK_WRAPPER_LOCAL" ]; then
+    g="$GROK_WRAPPER_LOCAL"
+  elif command -v grok >/dev/null 2>&1; then
     g="$(command -v grok)"
-    if head -5 "$g" 2>/dev/null | grep -q 'FILTER\|mouse-filter'; then
+  fi
+  if [ -n "$g" ]; then
+    if is_filtered_grok_entry "$g"; then
       log "OK: grok -> filtered wrapper ($g)"
-    elif file "$g" 2>/dev/null | grep -qi 'ELF'; then
-      warn "grok is bare ELF (not filtered): $g — re-run install"
+    elif is_elf_file "$g"; then
+      warn "FAIL: grok is bare ELF (not filtered): $g — re-run install; hash -r; prefer ~/.local/bin"
       fail=1
     else
-      log "OK: grok at $g (check manually)"
+      local resolved
+      resolved="$(readlink -f "$g" 2>/dev/null || printf '%s' "$g")"
+      if is_elf_file "$resolved"; then
+        warn "FAIL: grok is symlink to bare ELF (not filtered): $g -> $resolved"
+        fail=1
+      else
+        warn "FAIL: grok at $g is not a mouse-leak-filter-entry wrapper"
+        fail=1
+      fi
     fi
+  else
+    warn "FAIL: grok not found on PATH and no $GROK_WRAPPER_LOCAL"
+    fail=1
+  fi
+  # Simulate hostile PATH where vendor bin wins — must still detect failure if that is what command -v sees
+  if [ -x "$GROK_BIN_DIR/grok" ] && is_elf_file "$GROK_BIN_DIR/grok"; then
+    local hostile
+    hostile="$(PATH="$GROK_BIN_DIR:/usr/bin:/bin" command -v grok 2>/dev/null || true)"
+    if [ -n "$hostile" ] && ! is_filtered_grok_entry "$hostile"; then
+      log "OK: bare-ELF-first PATH would resolve to unfiltered ($hostile) — install hooks use grok() to override"
+    fi
+  fi
+  # Running unfiltered TUI is a residual failure mode (not a hard check fail if install is correct)
+  local unf
+  unf="$(list_unfiltered_grok_pids || true)"
+  if [ -n "$unf" ]; then
+    warn "NOTE: unfiltered Grok still running (restart required):"
+    printf '%s\n' "$unf" | while IFS= read -r line; do warn "  $line"; done
+    warn "NOTE: --check can PASS install state while an old TUI still leaks mouse; exit it and relaunch."
   fi
   [ "$fail" -eq 0 ] || die "check found problems (re-run without --check to fix)"
   log "Check PASSED"
@@ -946,6 +1081,7 @@ main() {
   install_grok_config
   apply_now
   run_selftest
+  hash -r 2>/dev/null || true
 
   cat <<EOF
 
@@ -956,21 +1092,29 @@ What was installed
   - $GUARD_SH
   - $MOUSE_OFF_BIN
   - $FILTER_PY          ← only used for interactive Grok TUI
-  - $GROK_WRAPPER_LOCAL
+  - $GROK_WRAPPER_LOCAL  (identity: $WRAPPER_IDENTITY)
   - OPENCODE_DISABLE_MOUSE=1 in shell hooks (native OpenCode support)
+  - grok() shell function → absolute $GROK_WRAPPER_LOCAL (beats hash/PATH)
   - Shell hooks in ~/.zshrc and ~/.bashrc (after Lightning managed block)
   - ~/.vimrc mouse off, ~/.screenrc / ~/.tmux.conf, optional /settings/.screenrc
   - ~/.grok/config.toml mouse hover off (if .grok exists)
 
-IMPORTANT — restart Grok
-  Already-running Grok processes still use the old binary path.
-  Exit Grok (/exit or Ctrl+C), then:
+IMPORTANT — why "--check OK" can still feel broken
+  1) Long-lived shells keep old LESS / command hash until re-source or new shell.
+  2) Already-running unfiltered Grok (bare ELF under zsh) must be exited.
+  3) Next launch must use the filtered entry (grok function or ~/.local/bin first).
 
+Do this now in every open terminal
+      hash -r
+      source ~/.zshrc 2>/dev/null || source ~/.bashrc
+      # or open a new shell tab
+      # exit any running Grok TUI, then:
       grok
 
 Manual reset anytime
       mouse_off
       mouse-tracking-off
+      bash $0 --now
 
 Verify later
       bash $0 --check

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Grok entry + mouse-leak PTY filter (fix-lightning-mouse-leak.sh v2.3)
+# mouse-leak-filter-entry v2.5.0
+# Grok entry + mouse-leak PTY filter (fix-lightning-mouse-leak.sh v2.5.0)
 # Works under bash and when invoked from zsh (this file is bash; zsh just execs it).
+# Identity string above is required by fix-lightning-mouse-leak.sh --check.
 set -u
 
 _find_python() {
